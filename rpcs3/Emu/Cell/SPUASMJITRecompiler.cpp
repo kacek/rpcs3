@@ -1820,6 +1820,7 @@ void spu_recompiler::DFNMA(spu_opcode_t op)
 	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
 	c->addpd(vt, va);
 	c->xorpd(va, va);
+	c->vzeroupper();
 	c->subpd(va, vt);
 	c->movapd(SPU_OFF_128(gpr, op.rt), va);
 }
