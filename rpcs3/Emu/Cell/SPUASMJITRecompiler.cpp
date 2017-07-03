@@ -444,6 +444,7 @@ void spu_recompiler::RDCH(spu_opcode_t op)
 		const XmmLink& vr = XmmAlloc();
 		c->movd(vr, SPU_OFF_32(srr0));
 		c->pslldq(vr, 12);
+		c->vzeroupper();
 		c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
 		return;
 	}
@@ -452,6 +453,7 @@ void spu_recompiler::RDCH(spu_opcode_t op)
 		const XmmLink& vr = XmmAlloc();
 		c->movd(vr, SPU_OFF_32(ch_tag_mask));
 		c->pslldq(vr, 12);
+		c->vzeroupper();
 		c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
 		return;
 	}
@@ -460,6 +462,7 @@ void spu_recompiler::RDCH(spu_opcode_t op)
 		const XmmLink& vr = XmmAlloc();
 		c->movd(vr, SPU_OFF_32(ch_event_mask));
 		c->pslldq(vr, 12);
+		c->vzeroupper();
 		c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
 		return;
 	}
@@ -480,6 +483,7 @@ void spu_recompiler::SF(spu_opcode_t op)
 	// sub from
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->psubd(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -487,6 +491,7 @@ void spu_recompiler::OR(spu_opcode_t op)
 {
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->por(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -500,6 +505,7 @@ void spu_recompiler::BG(spu_opcode_t op)
 	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
 	c->pcmpgtd(va, vi);
 	c->paddd(va, XmmConst(_mm_set1_epi32(1)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -508,6 +514,7 @@ void spu_recompiler::SFH(spu_opcode_t op)
 	// sub from (halfword)
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->psubw(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -516,6 +523,7 @@ void spu_recompiler::NOR(spu_opcode_t op)
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->por(va, SPU_OFF_128(gpr, op.rb));
 	c->pxor(va, XmmConst(_mm_set1_epi32(0xffffffff)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -528,6 +536,7 @@ void spu_recompiler::ABSDB(spu_opcode_t op)
 	c->pmaxub(va, vb);
 	c->pminub(vb, vm);
 	c->psubb(va, vb);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -761,6 +770,7 @@ void spu_recompiler::ROTI(spu_opcode_t op)
 	c->pslld(va, s);
 	c->psrld(v1, 32 - s);
 	c->por(va, v1);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -770,6 +780,7 @@ void spu_recompiler::ROTMI(spu_opcode_t op)
 	const int s = 0-op.i7 & 0x3f;
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->psrld(va, s);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -779,6 +790,7 @@ void spu_recompiler::ROTMAI(spu_opcode_t op)
 	const int s = 0-op.i7 & 0x3f;
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->psrad(va, s);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -788,6 +800,7 @@ void spu_recompiler::SHLI(spu_opcode_t op)
 	const int s = op.i7 & 0x3f;
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pslld(va, s);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -801,6 +814,7 @@ void spu_recompiler::ROTHI(spu_opcode_t op)
 	c->psllw(va, s);
 	c->psrlw(v1, 16 - s);
 	c->por(va, v1);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -810,6 +824,7 @@ void spu_recompiler::ROTHMI(spu_opcode_t op)
 	const int s = 0-op.i7 & 0x1f;
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->psrlw(va, s);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -819,6 +834,7 @@ void spu_recompiler::ROTMAHI(spu_opcode_t op)
 	const int s = 0-op.i7 & 0x1f;
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->psraw(va, s);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -828,6 +844,7 @@ void spu_recompiler::SHLHI(spu_opcode_t op)
 	const int s = op.i7 & 0x1f;
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->psllw(va, s);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -835,6 +852,7 @@ void spu_recompiler::A(spu_opcode_t op)
 {
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->paddd(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -843,6 +861,7 @@ void spu_recompiler::AND(spu_opcode_t op)
 	// and
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->pand(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -857,6 +876,7 @@ void spu_recompiler::CG(spu_opcode_t op)
 	c->pxor(vb, vi);
 	c->pcmpgtd(va, vb);
 	c->psrld(va, 31);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -864,6 +884,7 @@ void spu_recompiler::AH(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->paddw(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -873,6 +894,7 @@ void spu_recompiler::NAND(spu_opcode_t op)
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pand(va, SPU_OFF_128(gpr, op.rb));
 	c->pxor(va, XmmConst(_mm_set1_epi32(0xffffffff)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -880,6 +902,7 @@ void spu_recompiler::AVGB(spu_opcode_t op)
 {
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->pavgb(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1058,6 +1081,7 @@ void spu_recompiler::GB(spu_opcode_t op)
 	c->pmovmskb(*addr, va);
 	c->pxor(va, va);
 	c->pinsrw(va, *addr, 6);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 	c->unuse(*addr);
 }
@@ -1070,6 +1094,7 @@ void spu_recompiler::GBH(spu_opcode_t op)
 	c->pmovmskb(*addr, va);
 	c->pxor(va, va);
 	c->pinsrw(va, *addr, 6);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 	c->unuse(*addr);
 }
@@ -1081,6 +1106,7 @@ void spu_recompiler::GBB(spu_opcode_t op)
 	c->pmovmskb(*addr, va);
 	c->pxor(va, va);
 	c->pinsrw(va, *addr, 6);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 	c->unuse(*addr);
 }
@@ -1128,6 +1154,7 @@ void spu_recompiler::FREST(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
 	c->rcpps(va, va);
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1136,6 +1163,7 @@ void spu_recompiler::FRSQEST(spu_opcode_t op)
 	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
 	c->andps(va, XmmConst(_mm_set1_epi32(0x7fffffff))); // abs
 	c->rsqrtps(va, va);
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1525,6 +1553,7 @@ void spu_recompiler::CGT(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pcmpgtd(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1533,6 +1562,7 @@ void spu_recompiler::XOR(spu_opcode_t op)
 	// xor
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pxor(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1540,6 +1570,7 @@ void spu_recompiler::CGTH(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pcmpgtw(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1548,6 +1579,7 @@ void spu_recompiler::EQV(spu_opcode_t op)
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->pxor(vb, XmmConst(_mm_set1_epi32(0xffffffff)));
 	c->pxor(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1555,6 +1587,7 @@ void spu_recompiler::CGTB(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pcmpgtb(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1567,6 +1600,7 @@ void spu_recompiler::SUMB(spu_opcode_t op)
 	c->pmaddubsw(va, vi);
 	c->pmaddubsw(vb, vi);
 	c->phaddw(va, vb);
+	c->vzeroupper();
 	c->pshufb(va, XmmConst(_mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0)));
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
@@ -1623,6 +1657,7 @@ void spu_recompiler::XSHW(spu_opcode_t op)
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pslld(va, 16);
 	c->psrad(va, 16);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1641,6 +1676,7 @@ void spu_recompiler::CNTB(spu_opcode_t op)
 	c->movdqa(va, XmmConst(_mm_set_epi8(4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0)));
 	c->pshufb(va, v1);
 	c->paddb(va, vm);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1649,6 +1685,7 @@ void spu_recompiler::XSBH(spu_opcode_t op)
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->psllw(va, 8);
 	c->psraw(va, 8);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1661,6 +1698,7 @@ void spu_recompiler::CLGT(spu_opcode_t op)
 	c->pxor(va, vi);
 	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
 	c->pcmpgtd(va, vi);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1669,6 +1707,7 @@ void spu_recompiler::ANDC(spu_opcode_t op)
 	// and not
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->pandn(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1677,6 +1716,7 @@ void spu_recompiler::FCGT(spu_opcode_t op)
 	// reverted less-than
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
 	c->cmpps(vb, SPU_OFF_128(gpr, op.ra), 1);
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1689,6 +1729,7 @@ void spu_recompiler::FA(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
 	c->addps(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1696,6 +1737,7 @@ void spu_recompiler::FS(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
 	c->subps(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1703,6 +1745,7 @@ void spu_recompiler::FM(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
 	c->mulps(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1715,6 +1758,7 @@ void spu_recompiler::CLGTH(spu_opcode_t op)
 	c->pxor(va, vi);
 	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
 	c->pcmpgtw(va, vi);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1723,6 +1767,7 @@ void spu_recompiler::ORC(spu_opcode_t op)
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
 	c->pxor(vb, XmmConst(_mm_set1_epi32(0xffffffff)));
 	c->por(vb, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1735,6 +1780,7 @@ void spu_recompiler::FCMGT(spu_opcode_t op)
 	c->andps(vb, vi); // abs
 	c->andps(vi, SPU_OFF_128(gpr, op.ra));
 	c->cmpps(vb, vi, 1);
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1747,6 +1793,7 @@ void spu_recompiler::DFA(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
 	c->addpd(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movapd(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1754,6 +1801,7 @@ void spu_recompiler::DFS(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
 	c->subpd(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movapd(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1761,6 +1809,7 @@ void spu_recompiler::DFM(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
 	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movapd(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1773,6 +1822,7 @@ void spu_recompiler::CLGTB(spu_opcode_t op)
 	c->pxor(va, vi);
 	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
 	c->pcmpgtb(va, vi);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1792,6 +1842,7 @@ void spu_recompiler::DFMA(spu_opcode_t op)
 	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
 	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
 	c->addpd(vr, va);
+	c->vzeroupper();
 	c->movapd(SPU_OFF_128(gpr, op.rt), vr);
 }
 
@@ -1801,6 +1852,7 @@ void spu_recompiler::DFMS(spu_opcode_t op)
 	const XmmLink& vt = XmmGet(op.rt, XmmType::Double);
 	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
 	c->subpd(va, vt);
+	c->vzeroupper();
 	c->movapd(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1810,6 +1862,7 @@ void spu_recompiler::DFNMS(spu_opcode_t op)
 	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
 	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
 	c->subpd(vr, va);
+	c->vzeroupper();
 	c->movapd(SPU_OFF_128(gpr, op.rt), vr);
 }
 
@@ -1821,6 +1874,7 @@ void spu_recompiler::DFNMA(spu_opcode_t op)
 	c->addpd(vt, va);
 	c->xorpd(va, va);
 	c->subpd(va, vt);
+	c->vzeroupper();
 	c->movapd(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1828,6 +1882,7 @@ void spu_recompiler::CEQ(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pcmpeqd(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1842,6 +1897,7 @@ void spu_recompiler::MPYHHU(spu_opcode_t op)
 	c->pand(va, XmmConst(_mm_set1_epi32(0xffff0000)));
 	c->psrld(va2, 16);
 	c->por(va, va2);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1851,6 +1907,7 @@ void spu_recompiler::ADDX(spu_opcode_t op)
 	c->pand(vt, XmmConst(_mm_set1_epi32(1)));
 	c->paddd(vt, SPU_OFF_128(gpr, op.ra));
 	c->paddd(vt, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
 }
 
@@ -1861,6 +1918,7 @@ void spu_recompiler::SFX(spu_opcode_t op)
 	c->pandn(vt, XmmConst(_mm_set1_epi32(1)));
 	c->psubd(vb, SPU_OFF_128(gpr, op.ra));
 	c->psubd(vb, vt);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1912,6 +1970,7 @@ void spu_recompiler::MPYHHA(spu_opcode_t op)
 	c->psrld(vb, 16);
 	c->pmaddwd(va, vb);
 	c->paddd(vt, va);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
 }
 
@@ -1928,6 +1987,7 @@ void spu_recompiler::MPYHHAU(spu_opcode_t op)
 	c->psrld(va2, 16);
 	c->paddd(vt, va);
 	c->paddd(vt, va2);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
 }
 
@@ -1936,6 +1996,7 @@ void spu_recompiler::FSCRRD(spu_opcode_t op)
 	// zero (hack)
 	const XmmLink& v0 = XmmAlloc();
 	c->pxor(v0, v0);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), v0);
 }
 
@@ -1970,6 +2031,7 @@ void spu_recompiler::FCEQ(spu_opcode_t op)
 	// compare equal
 	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
 	c->cmpps(vb, SPU_OFF_128(gpr, op.ra), 0);
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -1987,6 +2049,7 @@ void spu_recompiler::MPY(spu_opcode_t op)
 	c->pand(va, vi);
 	c->pand(vb, vi);
 	c->pmaddwd(va, vb);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -1997,6 +2060,7 @@ void spu_recompiler::MPYH(spu_opcode_t op)
 	c->psrld(va, 16);
 	c->pmullw(va, vb);
 	c->pslld(va, 16);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2007,6 +2071,7 @@ void spu_recompiler::MPYHH(spu_opcode_t op)
 	c->psrld(va, 16);
 	c->psrld(vb, 16);
 	c->pmaddwd(va, vb);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2017,6 +2082,7 @@ void spu_recompiler::MPYS(spu_opcode_t op)
 	c->pmulhw(va, vb);
 	c->pslld(va, 16);
 	c->psrad(va, 16);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2024,6 +2090,7 @@ void spu_recompiler::CEQH(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pcmpeqw(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2035,6 +2102,7 @@ void spu_recompiler::FCMEQ(spu_opcode_t op)
 	c->andps(vb, vi); // abs
 	c->andps(vi, SPU_OFF_128(gpr, op.ra));
 	c->cmpps(vb, vi, 0); // ==
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
 }
 
@@ -2054,6 +2122,7 @@ void spu_recompiler::MPYU(spu_opcode_t op)
 	c->pslld(va, 16);
 	c->pand(va2, XmmConst(_mm_set1_epi32(0xffff)));
 	c->por(va, va2);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2061,6 +2130,7 @@ void spu_recompiler::CEQB(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pcmpeqb(va, SPU_OFF_128(gpr, op.rb));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2090,6 +2160,7 @@ void spu_recompiler::CFLTS(spu_opcode_t op)
 	c->cmpps(vi, va, 2);
 	c->cvttps2dq(va, va); // convert to ints with truncation
 	c->pxor(va, vi); // fix result saturation (0x80000000 -> 0x7fffffff)
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2112,6 +2183,7 @@ void spu_recompiler::CFLTU(spu_opcode_t op)
 	c->cvttps2dq(vs2, vs2);
 	c->por(va, vs);
 	c->por(va, vs2);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2133,6 +2205,7 @@ void spu_recompiler::CUFLT(spu_opcode_t op)
 	c->psrad(v1, 31); // generate mask from sign bit
 	c->andps(v1, XmmConst(_mm_set1_ps(std::exp2(31.f)))); // generate correction component
 	c->addps(va, v1); // add correction component
+	c->vzeroupper();
 	if (op.i8 != 155) c->mulps(va, XmmConst(_mm_set1_ps(std::exp2(static_cast<float>(static_cast<s16>(op.i8 - 155)))))); // scale
 	c->movaps(SPU_OFF_128(gpr, op.rt), va);
 }
@@ -2392,6 +2465,7 @@ void spu_recompiler::IOHL(spu_opcode_t op)
 {
 	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
 	c->por(vt, XmmConst(_mm_set1_epi32(op.i16)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
 }
 
@@ -2405,7 +2479,7 @@ void spu_recompiler::ORI(spu_opcode_t op)
 void spu_recompiler::ORHI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
-	c->por(va, XmmConst(_mm_set1_epi16(op.si10)));
+	c->por(va, XmmConst(_mm_set1_epi16(op.si10)));c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2413,6 +2487,7 @@ void spu_recompiler::ORBI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->por(va, XmmConst(_mm_set1_epi8(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2421,6 +2496,7 @@ void spu_recompiler::SFI(spu_opcode_t op)
 	const XmmLink& vr = XmmAlloc();
 	c->movdqa(vr, XmmConst(_mm_set1_epi32(op.si10)));
 	c->psubd(vr, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
 }
 
@@ -2429,6 +2505,7 @@ void spu_recompiler::SFHI(spu_opcode_t op)
 	const XmmLink& vr = XmmAlloc();
 	c->movdqa(vr, XmmConst(_mm_set1_epi16(op.si10)));
 	c->psubw(vr, SPU_OFF_128(gpr, op.ra));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
 }
 
@@ -2436,6 +2513,7 @@ void spu_recompiler::ANDI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pand(va, XmmConst(_mm_set1_epi32(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2443,6 +2521,7 @@ void spu_recompiler::ANDHI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pand(va, XmmConst(_mm_set1_epi16(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2450,6 +2529,7 @@ void spu_recompiler::ANDBI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pand(va, XmmConst(_mm_set1_epi8(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2458,6 +2538,7 @@ void spu_recompiler::AI(spu_opcode_t op)
 	// add
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->paddd(va, XmmConst(_mm_set1_epi32(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2466,6 +2547,7 @@ void spu_recompiler::AHI(spu_opcode_t op)
 	// add
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->paddw(va, XmmConst(_mm_set1_epi16(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2498,6 +2580,7 @@ void spu_recompiler::XORI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pxor(va, XmmConst(_mm_set1_epi32(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2505,6 +2588,7 @@ void spu_recompiler::XORHI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pxor(va, XmmConst(_mm_set1_epi16(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2512,6 +2596,7 @@ void spu_recompiler::XORBI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pxor(va, XmmConst(_mm_set1_epi8(op.si10)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2584,6 +2669,7 @@ void spu_recompiler::MPYI(spu_opcode_t op)
 {
 	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
 	c->pmaddwd(va, XmmConst(_mm_set1_epi32(op.si10 & 0xffff)));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2598,6 +2684,7 @@ void spu_recompiler::MPYUI(spu_opcode_t op)
 	c->pmullw(va2, vi);
 	c->pslld(va, 16);
 	c->por(va, va2);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
 }
 
@@ -2654,6 +2741,7 @@ void spu_recompiler::SELB(spu_opcode_t op)
 	c->pand(vb, vc);
 	c->pandn(vc, SPU_OFF_128(gpr, op.ra));
 	c->por(vb, vc);
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt4), vb);
 }
 
@@ -2693,6 +2781,7 @@ void spu_recompiler::SHUFB(spu_opcode_t op)
 	c->por(v1, v3); //                   v1 = select(op.rb, 00001111 - ((mask & 00011111) ^ 00010000)) | (v3)
 	c->pandn(v4, v1); // filter result   v4 = v1 & ((mask & 10000000 == 10000000) ? 0 : 0xff)
 	c->por(vFF, v4); // final merge      vFF = (mask & 10000000 == 10000000) ? ((mask & 11100000 == 11000000) ? 0xff : (mask & 11100000 == 11100000) ? 0x80 : 0) : (v1)
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt4), vFF);
 }
 
@@ -2706,6 +2795,7 @@ void spu_recompiler::MPYA(spu_opcode_t op)
 	c->pand(vb, vi);
 	c->pmaddwd(va, vb);
 	c->paddd(va, SPU_OFF_128(gpr, op.rc));
+	c->vzeroupper();
 	c->movdqa(SPU_OFF_128(gpr, op.rt4), va);
 }
 
@@ -2729,6 +2819,7 @@ void spu_recompiler::FNMS(spu_opcode_t op)
 
 	c->mulps(tmp_a, tmp_b);
 	c->subps(vc, tmp_a);
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt4), vc);
 }
 
@@ -2752,6 +2843,7 @@ void spu_recompiler::FMA(spu_opcode_t op)
 
 	c->mulps(tmp_a, tmp_b);
 	c->addps(tmp_a, SPU_OFF_128(gpr, op.rc));
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt4), tmp_a);
 }
 
@@ -2775,6 +2867,7 @@ void spu_recompiler::FMS(spu_opcode_t op)
 
 	c->mulps(tmp_a, tmp_b);
 	c->subps(tmp_a, SPU_OFF_128(gpr, op.rc));
+	c->vzeroupper();
 	c->movaps(SPU_OFF_128(gpr, op.rt4), tmp_a);
 }
 
