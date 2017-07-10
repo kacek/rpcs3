@@ -17,7 +17,8 @@ s32 cellWebBrowserConfig()
 
 s32 cellWebBrowserConfig2()
 {
-	fmt::throw_exception("Unimplemented" HERE);
+	cellSysutil.todo("cellWebBrowserConfig2()");
+	return CELL_OK;
 }
 
 s32 cellWebBrowserConfigGetHeapSize()
