@@ -41,7 +41,7 @@
 #include "Utilities/StrUtil.h"
 
 #include "rpcs3_version.h"
-#include "system_info.h"
+#include "Utilities/sysinfo.h"
 
 #include "ui_main_window.h"
 
@@ -112,13 +112,13 @@ void main_window::Init()
 	RequestGlobalStylesheetChange(guiSettings->GetCurrentStylesheetPath());
 	ConfigureGuiFromSettings(true);
 	
-	if (!System_Info::getCPU().second)
+	if (!utils::has_ssse3())
 	{
 		QMessageBox::critical(this, "SSSE3 Error (with three S, not two)",
 			"Your system does not meet the minimum requirements needed to run RPCS3.\n"
-			"Your CPU does not support SSSE3 (with three S, not two).\n"
-			"\n"
-			"No games will run and RPCS3 will crash if you try.");
+			"Your CPU does not support SSSE3 (with three S, not two).\n");
+
+		std::exit(EXIT_FAILURE);
 	}
 }
 
@@ -729,6 +729,8 @@ void main_window::OnEmuPause()
 void main_window::OnEmuStop()
 {
 	debuggerFrame->EnableButtons(false);
+	debuggerFrame->ClearBreakpoints();
+
 	ui->sysPauseAct->setText(Emu.IsReady() ? tr("&Start\tCtrl+E") : tr("&Resume\tCtrl+E"));
 	ui->sysPauseAct->setIcon(icon_play);
 #ifdef _WIN32
@@ -1188,10 +1190,6 @@ void main_window::CreateConnects()
 		bool isList = act == ui->setlistModeListAct;
 		gameListFrame->SetListMode(isList);
 		categoryVisibleActGroup->setEnabled(isList);
-	});
-	connect(ui->toolBar, &QToolBar::visibilityChanged, [=](bool checked) {
-		ui->showToolBarAct->setChecked(checked);
-		guiSettings->SetValue(GUI::mw_toolBarVisible, checked);
 	});
 	connect(ui->toolbar_disc, &QAction::triggered, this, &main_window::BootGame);
 	connect(ui->toolbar_refresh, &QAction::triggered, [=]() { gameListFrame->Refresh(true); });
