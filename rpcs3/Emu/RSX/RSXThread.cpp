@@ -34,53 +34,55 @@ namespace rsx
 
 		switch (location)
 		{
-			case CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER:
-			case CELL_GCM_LOCATION_LOCAL:
+		case CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER:
+		case CELL_GCM_LOCATION_LOCAL:
+		{
+			// TODO: Don't use unnamed constants like 0xC0000000
+			return 0xC0000000 + offset;
+		}
+
+		case CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER:
+		case CELL_GCM_LOCATION_MAIN:
+		{
+			if (u32 result = RSXIOMem.RealAddr(offset))
 			{
-				// TODO: Don't use unnamed constants like 0xC0000000
-				return 0xC0000000 + offset;
+				return result;
 			}
 
-			case CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER:
-			case CELL_GCM_LOCATION_MAIN:
+			fmt::throw_exception("GetAddress(offset=0x%x, location=0x%x): RSXIO memory not mapped" HERE, offset, location);
+		}
+
+		case CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_LOCAL:
+			return 0x40301400 + offset;
+
+		case CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN:
+		{
+			if (u32 result = RSXIOMem.RealAddr(0x0e000000 + offset))
 			{
-				if (u32 result = RSXIOMem.RealAddr(offset))
-				{
-					return result;
-				}
-
-				fmt::throw_exception("GetAddress(offset=0x%x, location=0x%x): RSXIO memory not mapped" HERE, offset, location);
-
-				//if (fxm::get<GSRender>()->strict_ordering[offset >> 20])
-				//{
-				//	_mm_mfence(); // probably doesn't have any effect on current implementation
-				//}
+				return result;
 			}
 
-			case CELL_GCM_CONTEXT_DMA_TO_MEMORY_GET_REPORT:
-				return 0x100000 + offset; // TODO: Properly implement
+			fmt::throw_exception("GetAddress(offset=0x%x, location=0x%x): RSXIO memory not mapped" HERE, offset, location);
+		}
 
-			case CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN:
-				return 0x800 + offset;	// TODO: Properly implement
+		case CELL_GCM_CONTEXT_DMA_TO_MEMORY_GET_NOTIFY0:
+			fmt::throw_exception("Unimplemented CELL_GCM_CONTEXT_DMA_TO_MEMORY_GET_NOTIFY0 (offset=0x%x, location=0x%x)" HERE, offset, location);
 
-			case CELL_GCM_CONTEXT_DMA_TO_MEMORY_GET_NOTIFY0:
-				return 0x40 + offset; // TODO: Properly implement
+		case CELL_GCM_CONTEXT_DMA_NOTIFY_MAIN_0:
+			fmt::throw_exception("Unimplemented CELL_GCM_CONTEXT_DMA_NOTIFY_MAIN_0 (offset=0x%x, location=0x%x)" HERE, offset, location);
 
-			case CELL_GCM_CONTEXT_DMA_NOTIFY_MAIN_0:
-				fmt::throw_exception("Unimplemented CELL_GCM_CONTEXT_DMA_NOTIFY_MAIN_0 (offset=0x%x, location=0x%x)" HERE, offset, location);
+		case CELL_GCM_CONTEXT_DMA_SEMAPHORE_RW:
+		case CELL_GCM_CONTEXT_DMA_SEMAPHORE_R:
+			return 0x40300000 + offset;
 
-			case CELL_GCM_CONTEXT_DMA_SEMAPHORE_RW:
-			case CELL_GCM_CONTEXT_DMA_SEMAPHORE_R:
-				return 0x100 + offset; // TODO: Properly implement
+		case CELL_GCM_CONTEXT_DMA_DEVICE_RW:
+			return 0x40000000 + offset;
 
-			case CELL_GCM_CONTEXT_DMA_DEVICE_RW:
-				fmt::throw_exception("Unimplemented CELL_GCM_CONTEXT_DMA_DEVICE_RW (offset=0x%x, location=0x%x)" HERE, offset, location);
+		case CELL_GCM_CONTEXT_DMA_DEVICE_R:
+			return 0x40000000 + offset;
 
-			case CELL_GCM_CONTEXT_DMA_DEVICE_R:
-				fmt::throw_exception("Unimplemented CELL_GCM_CONTEXT_DMA_DEVICE_R (offset=0x%x, location=0x%x)" HERE, offset, location);
-
-			default:
-				fmt::throw_exception("Invalid location (offset=0x%x, location=0x%x)" HERE, offset, location);
+		default:
+			fmt::throw_exception("Invalid location (offset=0x%x, location=0x%x)" HERE, offset, location);
 		}
 	}
 
@@ -123,7 +125,7 @@ namespace rsx
 				return sizeof(u8) * 4;
 			}
 			fmt::throw_exception("Wrong vector size" HERE);
-		case vertex_base_type::cmp: return sizeof(u16) * 4;
+		case vertex_base_type::cmp: return 4;
 		case vertex_base_type::ub256: verify(HERE), (size == 4); return sizeof(u8) * 4;
 		}
 		fmt::throw_exception("RSXVertexData::GetTypeSize: Bad vertex data type (%d)!" HERE, (u8)type);
@@ -307,32 +309,6 @@ namespace rsx
 		return (u32)element_push_buffer.size();
 	}
 
-	bool thread::is_probable_instanced_draw()
-	{
-		if (!g_cfg.video.batch_instanced_geometry)
-			return false;
-
-		//If the array registers have not been touched, the index array has also not been touched via notify or via register set, its likely an instanced draw
-		//gcm lib will set the registers once and then call the same draw command over and over with different transform params to achieve this
-		if (m_index_buffer_changed || m_vertex_attribs_changed)
-			return false;
-
-		auto& draw_clause = rsx::method_registers.current_draw_clause;
-		if (draw_clause.command != m_last_command)
-			return false;
-
-		if (draw_clause.command != rsx::draw_command::inlined_array)
-		{
-			if (draw_clause.first_count_commands.back().second != m_last_first_count.second ||
-				draw_clause.first_count_commands.front().first != m_last_first_count.first)
-				return false;
-		}
-		else if (m_last_first_count.second != draw_clause.inline_vertex_array.size())
-			return false;
-
-		return true;
-	}
-
 	void thread::end()
 	{
 		rsx::method_registers.transform_constants.clear();
@@ -353,17 +329,6 @@ namespace rsx
 			u32 element_count = rsx::method_registers.current_draw_clause.get_elements_count();
 			capture_frame("Draw " + rsx::to_string(rsx::method_registers.current_draw_clause.primitive) + std::to_string(element_count));
 		}
-
-		auto& clause = rsx::method_registers.current_draw_clause;
-		
-		m_last_command = clause.command;
-		if (m_last_command == rsx::draw_command::inlined_array)
-			m_last_first_count = std::make_pair(0, (u32)clause.inline_vertex_array.size());
-		else
-			m_last_first_count = std::make_pair(clause.first_count_commands.front().first, clause.first_count_commands.back().second);
-
-		m_index_buffer_changed = false;
-		m_vertex_attribs_changed = false;
 	}
 
 	void thread::on_task()
@@ -386,7 +351,7 @@ namespace rsx
 				if (get_system_time() - start_time > vblank_count * 1000000 / 60)
 				{
 					vblank_count++;
-
+					sys_rsx_context_attribute(0x55555555, 0xFED, 1, 0, 0, 0);
 					if (vblank_handler)
 					{
 						intr_thread->cmd_list
@@ -401,10 +366,15 @@ namespace rsx
 
 					continue;
 				}
+				while (Emu.IsPaused())
+					std::this_thread::sleep_for(10ms);
 
 				std::this_thread::sleep_for(1ms); // hack
 			}
 		});
+
+		// Raise priority above other threads
+		thread_ctrl::set_native_priority(1);
 
 		// TODO: exit condition
 		while (!Emu.IsStopped())
@@ -536,17 +506,6 @@ namespace rsx
 			m_vblank_thread->join();
 			m_vblank_thread.reset();
 		}
-
-		if (m_vertex_streaming_task.processing_threads.size() > 0)
-		{
-			for (auto &thr : m_vertex_streaming_task.processing_threads)
-			{
-				thr->join();
-				thr.reset();
-			}
-
-			m_vertex_streaming_task.processing_threads.resize(0);
-		}
 	}
 
 	std::string thread::get_name() const
@@ -628,6 +587,9 @@ namespace rsx
 	*/
 	void thread::fill_vertex_program_constants_data(void *buffer)
 	{
+		//Some games dont initialize some registers that they use in the vertex stage
+		memset(buffer, 0, 512 * 4 * sizeof(float));
+
 		for (const auto &entry : rsx::method_registers.transform_constants)
 			local_transform_constants[entry.first] = entry.second;
 		for (const auto &entry : local_transform_constants)
@@ -748,7 +710,7 @@ namespace rsx
 	}
 
 	std::vector<std::variant<vertex_array_buffer, vertex_array_register, empty_vertex_array>>
-	thread::get_vertex_buffers(const rsx::rsx_state& state, const std::vector<std::pair<u32, u32>>& vertex_ranges) const
+	thread::get_vertex_buffers(const rsx::rsx_state& state, const std::vector<std::pair<u32, u32>>& vertex_ranges, const u64 consumed_attrib_mask) const
 	{
 		std::vector<std::variant<vertex_array_buffer, vertex_array_register, empty_vertex_array>> result;
 		result.reserve(rsx::limits::vertex_count);
@@ -756,8 +718,10 @@ namespace rsx
 		u32 input_mask = state.vertex_attrib_input_mask();
 		for (u8 index = 0; index < rsx::limits::vertex_count; ++index)
 		{
-			bool enabled = !!(input_mask & (1 << index));
-			if (!enabled)
+			const bool enabled = !!(input_mask & (1 << index));
+			const bool consumed = !!(consumed_attrib_mask & (1ull << index));
+
+			if (!enabled && !consumed)
 				continue;
 
 			if (state.vertex_arrays_info[index].size() > 0)
@@ -818,7 +782,7 @@ namespace rsx
 	{
 		if (m_internal_tasks.empty())
 		{
-			std::this_thread::sleep_for(1ms);
+			std::this_thread::yield();
 		}
 		else
 		{
@@ -908,9 +872,10 @@ namespace rsx
 		return rsx::get_address(offset_zeta, m_context_dma_z);
 	}
 
-	RSXVertexProgram thread::get_current_vertex_program() const
+	void thread::get_current_vertex_program()
 	{
-		RSXVertexProgram result = {};
+		auto &result = current_vertex_program = {};
+
 		const u32 transform_program_start = rsx::method_registers.transform_program_start();
 		result.data.reserve((512 - transform_program_start) * 4);
 		result.rsx_vertex_inputs.reserve(rsx::limits::vertex_count);
@@ -968,16 +933,156 @@ namespace rsx
 						is_int_type(rsx::method_registers.vertex_arrays_info[index].type()), 0});
 			}
 		}
+	}
+
+	vertex_input_layout thread::analyse_inputs_interleaved() const
+	{
+		const rsx_state& state = rsx::method_registers;
+		const u32 input_mask = state.vertex_attrib_input_mask();
+
+		if (state.current_draw_clause.command == rsx::draw_command::inlined_array)
+		{
+			vertex_input_layout result = {};
+
+			interleaved_range_info info = {};
+			info.interleaved = true;
+			info.locations.reserve(8);
+
+			for (u8 index = 0; index < rsx::limits::vertex_count; ++index)
+			{
+				const u32 mask = (1u << index);
+				auto &vinfo = state.vertex_arrays_info[index];
+
+				if (vinfo.size() > 0)
+				{
+					info.locations.push_back(index);
+					info.attribute_stride += rsx::get_vertex_type_size_on_host(vinfo.type(), vinfo.size());
+					result.attribute_placement[index] = attribute_buffer_placement::transient;
+				}
+			}
+
+			result.interleaved_blocks.push_back(info);
+			return result;
+		}
+
+		const u32 frequency_divider_mask = rsx::method_registers.frequency_divider_operation_mask();
+		vertex_input_layout result = {};
+
+		for (u8 index = 0; index < rsx::limits::vertex_count; ++index)
+		{
+			const bool enabled = !!(input_mask & (1 << index));
+			if (!enabled)
+				continue;
+
+			if (vertex_push_buffers[index].size > 0)
+			{
+				std::pair<u8, u32> volatile_range_info = std::make_pair(index, static_cast<u32>(vertex_push_buffers[index].data.size() * sizeof(u32)));
+				result.volatile_blocks.push_back(volatile_range_info);
+				result.attribute_placement[index] = attribute_buffer_placement::transient;
+				continue;
+			}
+
+			//Check for interleaving
+			auto &info = state.vertex_arrays_info[index];
+			if (info.size() == 0 && state.register_vertex_info[index].size > 0)
+			{
+				//Reads from register
+				result.referenced_registers.push_back(index);
+				result.attribute_placement[index] = attribute_buffer_placement::transient;
+				continue;
+			}
+
+			if (info.size() > 0)
+			{
+				result.attribute_placement[index] = attribute_buffer_placement::persistent;
+				const u32 base_address = info.offset() & 0x7fffffff;
+				bool alloc_new_block = true;
+
+				for (auto &block : result.interleaved_blocks)
+				{
+					if (block.single_vertex)
+					{
+						//Single vertex definition, continue
+						continue;
+					}
+
+					if (block.attribute_stride != info.stride())
+					{
+						//Stride does not match, continue
+						continue;
+					}
+
+					if (base_address > block.base_offset)
+					{
+						const u32 diff = base_address - block.base_offset;
+						if (diff > info.stride())
+						{
+							//Not interleaved, continue
+							continue;
+						}
+					}
+					else
+					{
+						const u32 diff = block.base_offset - base_address;
+						if (diff > info.stride())
+						{
+							//Not interleaved, continue
+							continue;
+						}
+
+						//Matches, and this address is lower than existing
+						block.base_offset = base_address;
+					}
+
+					alloc_new_block = false;
+					block.locations.push_back(index);
+					block.interleaved = true;
+					block.min_divisor = std::min(block.min_divisor, info.frequency());
+
+					if (block.all_modulus)
+						block.all_modulus = !!(frequency_divider_mask & (1 << index));
+
+					break;
+				}
+
+				if (alloc_new_block)
+				{
+					interleaved_range_info block = {};
+					block.base_offset = base_address;
+					block.attribute_stride = info.stride();
+					block.memory_location = info.offset() >> 31;
+					block.locations.reserve(4);
+					block.locations.push_back(index);
+					block.min_divisor = info.frequency();
+					block.all_modulus = !!(frequency_divider_mask & (1 << index));
+
+					if (block.attribute_stride == 0)
+					{
+						block.single_vertex = true;
+						block.attribute_stride = rsx::get_vertex_type_size_on_host(info.type(), info.size());
+					}
+
+					result.interleaved_blocks.push_back(block);
+				}
+			}
+		}
+
+		for (auto &info : result.interleaved_blocks)
+		{
+			//Calculate real data address to be used during upload
+			info.real_offset_address = state.vertex_data_base_offset() + rsx::get_address(info.base_offset, info.memory_location);
+		}
+
 		return result;
 	}
 
-	RSXFragmentProgram thread::get_current_fragment_program(std::function<std::tuple<bool, u16>(u32, fragment_texture&, bool)> get_surface_info) const
+	void thread::get_current_fragment_program(std::function<std::tuple<bool, u16>(u32, fragment_texture&, bool)> get_surface_info)
 	{
-		RSXFragmentProgram result = {};
+		auto &result = current_fragment_program = {};
 
 		const u32 shader_program = rsx::method_registers.shader_program_address();
 		if (shader_program == 0)
-			return result;
+			return;
 
 		const u32 program_location = (shader_program & 0x3) - 1;
 		const u32 program_offset = (shader_program & ~0x3);
@@ -1005,18 +1110,27 @@ namespace rsx
 		{
 			auto &tex = rsx::method_registers.fragment_textures[i];
 			result.texture_pitch_scale[i] = 1.f;
+			result.textures_alpha_kill[i] = 0;
+			result.textures_zfunc[i] = 0;
 
 			if (!tex.enabled())
 			{
 				texture_dimensions[i] = texture_dimension_extended::texture_dimension_2d;
-				result.textures_alpha_kill[i] = 0;
-				result.textures_zfunc[i] = 0;
 			}
 			else
 			{
 				texture_dimensions[i] = tex.get_extended_texture_dimension();
-				result.textures_alpha_kill[i] = tex.alpha_kill_enabled() ? 1 : 0;
-				result.textures_zfunc[i] = tex.zfunc();
+
+				if (tex.alpha_kill_enabled())
+				{
+					//alphakill can be ignored unless a valid comparison function is set
+					const rsx::comparison_function func = (rsx::comparison_function)tex.zfunc();
+					if (func < rsx::comparison_function::always && func > rsx::comparison_function::never)
+					{
+						result.textures_alpha_kill[i] = 1;
+						result.textures_zfunc[i] = (u8)func;
+					}
+				}
 
 				const u32 texaddr = rsx::get_address(tex.offset(), tex.location());
 				const u32 raw_format = tex.format();
@@ -1040,20 +1154,28 @@ namespace rsx
 					if (surface_exists)
 					{
 						u32 format = raw_format & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN);
-						if (format == CELL_GCM_TEXTURE_A8R8G8B8 || format == CELL_GCM_TEXTURE_D8R8G8B8)
-							result.redirected_textures |= (1 << i);
-						else if (format == CELL_GCM_TEXTURE_DEPTH16 || format == CELL_GCM_TEXTURE_DEPTH24_D8)
-							result.shadow_textures |= (1 << i);
-						else
-							LOG_ERROR(RSX, "Depth texture bound to pipeline with unexpected format 0x%X", format);
+						switch (format)
+						{
+						case CELL_GCM_TEXTURE_A8R8G8B8:
+						case CELL_GCM_TEXTURE_D8R8G8B8:
+						case CELL_GCM_TEXTURE_A4R4G4B4:
+						case CELL_GCM_TEXTURE_R5G6B5:
+								result.redirected_textures |= (1 << i);
+								break;
+						case CELL_GCM_TEXTURE_DEPTH16:
+						case CELL_GCM_TEXTURE_DEPTH24_D8:
+						case CELL_GCM_TEXTURE_DEPTH16_FLOAT:
+								result.shadow_textures |= (1 << i);
+								break;
+						default:
+								LOG_ERROR(RSX, "Depth texture bound to pipeline with unexpected format 0x%X", format);
+						}
 					}
 				}
 			}
 		}
 
 		result.set_texture_dimension(texture_dimensions);
-
-		return result;
 	}
 
 	void thread::reset()
@@ -1061,9 +1183,9 @@ namespace rsx
 		rsx::method_registers.reset();
 	}
 
-	void thread::init(const u32 ioAddress, const u32 ioSize, const u32 ctrlAddress, const u32 localAddress)
+	void thread::init(u32 ioAddress, u32 ioSize, u32 ctrlAddress, u32 localAddress)
 	{
-		ctrl = vm::_ptr<CellGcmControl>(ctrlAddress);
+		ctrl = vm::_ptr<RsxDmaControl>(ctrlAddress);
 		this->ioAddress = ioAddress;
 		this->ioSize = ioSize;
 		local_mem_addr = localAddress;
@@ -1129,110 +1251,310 @@ namespace rsx
 		}
 	}
 
-	void thread::post_vertex_stream_to_upload(gsl::span<const gsl::byte> src, gsl::span<gsl::byte> dst, rsx::vertex_base_type type, u32 vector_element_count, u32 attribute_src_stride, u8 dst_stride, std::function<void(void *, rsx::vertex_base_type, u8, u32)> callback)
+	std::pair<u32, u32> thread::calculate_memory_requirements(vertex_input_layout& layout, const u32 vertex_count)
 	{
-		upload_stream_packet packet;
-		packet.dst_span = dst;
-		packet.src_span = src;
-		packet.src_stride = attribute_src_stride;
-		packet.type = type;
-		packet.dst_stride = dst_stride;
-		packet.vector_width = vector_element_count;
-		packet.post_upload_func = callback;
+		u32 persistent_memory_size = 0;
+		u32 volatile_memory_size = 0;
 
-		m_vertex_streaming_task.packets.push_back(packet);
-	}
+		volatile_memory_size += (u32)layout.referenced_registers.size() * 16u;
 
-	void thread::start_vertex_upload_task(u32 vertex_count)
-	{
-		if (m_vertex_streaming_task.processing_threads.size() == 0)
+		if (rsx::method_registers.current_draw_clause.command == rsx::draw_command::inlined_array)
 		{
-			const u32 streaming_thread_count = (u32)g_cfg.video.vertex_upload_threads;
-			m_vertex_streaming_task.processing_threads.resize(streaming_thread_count);
-
-			for (u32 n = 0; n < streaming_thread_count; ++n)
+			for (const auto &block : layout.interleaved_blocks)
 			{
-				thread_ctrl::spawn(m_vertex_streaming_task.processing_threads[n], "Vertex Stream " + std::to_string(n), [this, n]()
+				volatile_memory_size += block.attribute_stride * vertex_count;
+			}
+		}
+		else
+		{
+			//NOTE: Immediate commands can be index array only or both index array and vertex data
+			//Check both - but only check volatile blocks if immediate_draw flag is set
+			if (rsx::method_registers.current_draw_clause.is_immediate_draw)
+			{
+				for (const auto &info : layout.volatile_blocks)
 				{
-					auto &task = m_vertex_streaming_task;
-					const u32 index = n;
+					volatile_memory_size += info.second;
+				}
+			}
 
-					while (!Emu.IsStopped())
+			for (const auto &block : layout.interleaved_blocks)
+			{
+				u32 unique_verts;
+
+				if (block.single_vertex)
+				{
+					unique_verts = 1;
+				}
+				else if (block.min_divisor > 1)
+				{
+					if (block.all_modulus)
+						unique_verts = block.min_divisor;
+					else
 					{
-						if (task.remaining_packets != 0)
-						{
-							//Wait for me!
-							task.ready_threads--;
-
-							const size_t step = task.processing_threads.size();
-							const size_t job_count = task.packets.size();
-							//Process every nth packet
-
-							size_t current_job = index;
-
-							while (true)
-							{
-								if (current_job >= job_count)
-									break;
-
-								auto &packet = task.packets[current_job];
-
-								write_vertex_array_data_to_buffer(packet.dst_span, packet.src_span, task.vertex_count, packet.type, packet.vector_width, packet.src_stride, packet.dst_stride);
-
-								if (packet.post_upload_func)
-									packet.post_upload_func(packet.dst_span.data(), packet.type, (u8)packet.vector_width, task.vertex_count);
-
-								task.remaining_packets--;
-								current_job += step;
-								_mm_sfence();
-							}
-
-							_mm_mfence();
-
-							while (task.remaining_packets > 0 && !Emu.IsStopped())
-							{
-								std::this_thread::yield();
-								_mm_lfence();
-							}
-							
-							task.ready_threads++;
-							_mm_sfence();
-						}
-						else
-						{
-							std::this_thread::yield();
-						}
+						unique_verts = vertex_count / block.min_divisor;
+						if (vertex_count % block.min_divisor) unique_verts++;
 					}
-				});
+				}
+				else
+				{
+					unique_verts = vertex_count;
+				}
+
+				persistent_memory_size += block.attribute_stride * unique_verts;
 			}
 		}
 
-		while (m_vertex_streaming_task.ready_threads != 0 && !Emu.IsStopped())
-		{
-			_mm_pause();
-		}
-
-		m_vertex_streaming_task.vertex_count = vertex_count;
-		m_vertex_streaming_task.ready_threads = 0;
-		m_vertex_streaming_task.remaining_packets = (int)m_vertex_streaming_task.packets.size();
+		return std::make_pair(persistent_memory_size, volatile_memory_size);
 	}
 
-	void thread::wait_for_vertex_upload_task()
+	void thread::fill_vertex_layout_state(vertex_input_layout& layout, const u32 vertex_count, s32* buffer)
 	{
-		while (m_vertex_streaming_task.remaining_packets > 0 && !Emu.IsStopped())
+		std::array<s32, 16> offset_in_block = {};
+		u32 volatile_offset = 0;
+		u32 persistent_offset = 0;
+
+		if (rsx::method_registers.current_draw_clause.is_immediate_draw)
 		{
-			_mm_pause();
+			for (const auto &info : layout.volatile_blocks)
+			{
+				offset_in_block[info.first] = volatile_offset;
+				volatile_offset += info.second;
+			}
 		}
 
-		m_vertex_streaming_task.packets.resize(0);
+		for (u8 index : layout.referenced_registers)
+		{
+			offset_in_block[index] = volatile_offset;
+			volatile_offset += 16;
+		}
+
+		if (rsx::method_registers.current_draw_clause.command == rsx::draw_command::inlined_array)
+		{
+			const auto &block = layout.interleaved_blocks[0];
+			for (const u8 index : block.locations)
+			{
+				auto &info = rsx::method_registers.vertex_arrays_info[index];
+
+				offset_in_block[index] = persistent_offset; //just because this var is 0 when we enter here; inlined is transient memory
+				persistent_offset += rsx::get_vertex_type_size_on_host(info.type(), info.size());
+			}
+		}
+		else
+		{
+			for (const auto &block : layout.interleaved_blocks)
+			{
+				for (u8 index : block.locations)
+				{
+					const u32 local_address = (rsx::method_registers.vertex_arrays_info[index].offset() & 0x7fffffff);
+					offset_in_block[index] = persistent_offset + (local_address - block.base_offset);
+				}
+
+				u32 unique_verts;
+
+				if (block.single_vertex)
+				{
+					unique_verts = 1;
+				}
+				else if (block.min_divisor > 1)
+				{
+					if (block.all_modulus)
+						unique_verts = block.min_divisor;
+					else
+					{
+						unique_verts = vertex_count / block.min_divisor;
+						if (vertex_count % block.min_divisor) unique_verts++;
+					}
+				}
+				else
+				{
+					unique_verts = vertex_count;
+				}
+
+				persistent_offset += block.attribute_stride * unique_verts;
+			}
+		}
+
+		//Fill the data
+		memset(buffer, 0, 256);
+
+		const s32 swap_storage_mask = (1 << 8);
+		const s32 volatile_storage_mask = (1 << 9);
+		const s32 default_frequency_mask = (1 << 10);
+		const s32 repeating_frequency_mask = (3 << 10);
+		const s32 input_function_modulo_mask = (1 << 12);
+		const s32 input_divisor_mask = (0xFFFF << 13);
+
+		const u32 modulo_mask = rsx::method_registers.frequency_divider_operation_mask();
+
+		for (u8 index = 0; index < rsx::limits::vertex_count; ++index)
+		{
+			if (layout.attribute_placement[index] == attribute_buffer_placement::none)
+				continue;
+
+			rsx::vertex_base_type type = {};
+			s32 size = 0;
+			s32 attributes = 0;
+
+			bool is_be_type = true;
+
+			if (layout.attribute_placement[index] == attribute_buffer_placement::transient)
+			{
+				if (rsx::method_registers.current_draw_clause.command == rsx::draw_command::inlined_array)
+				{
+					auto &info = rsx::method_registers.vertex_arrays_info[index];
+					type = info.type();
+					size = info.size();
+
+					attributes = layout.interleaved_blocks[0].attribute_stride;
+					attributes |= default_frequency_mask | volatile_storage_mask;
+
+					is_be_type = false;
+				}
+				else
+				{
+					//Data is either from an immediate render or register input
+					//Immediate data overrides register input
+
+					if (rsx::method_registers.current_draw_clause.is_immediate_draw && vertex_push_buffers[index].size > 0)
+					{
+						const auto &info = rsx::method_registers.register_vertex_info[index];
+						type = info.type;
+						size = info.size;
+
+						attributes = rsx::get_vertex_type_size_on_host(type, size);
+						attributes |= default_frequency_mask | volatile_storage_mask;
+
+						is_be_type = true;
+					}
+					else
+					{
+						//Register
+						const auto& info = rsx::method_registers.register_vertex_info[index];
+						type = info.type;
+						size = info.size;
+
+						attributes = rsx::get_vertex_type_size_on_host(type, size);
+						attributes |= volatile_storage_mask;
+
+						is_be_type = false;
+					}
+				}
+			}
+			else
+			{
+				auto &info = rsx::method_registers.vertex_arrays_info[index];
+				type = info.type();
+				size = info.size();
+
+				auto stride = info.stride();
+				attributes |= stride;
+
+				if (stride > 0) //when stride is 0, input is not an array but a single element
+				{
+					const u32 frequency = info.frequency();
+					switch (frequency)
+					{
+					case 0:
+					case 1:
+						attributes |= default_frequency_mask;
+						break;
+					default:
+					{
+						if (modulo_mask & (1 << index))
+							attributes |= input_function_modulo_mask;
+
+						attributes |= repeating_frequency_mask;
+						attributes |= (frequency << 13) & input_divisor_mask;
+					}
+					}
+				}
+			} //end attribute placement check
+
+			switch (type)
+			{
+			case rsx::vertex_base_type::cmp:
+				size = 1;
+				//fall through
+			default:
+				if (is_be_type) attributes |= swap_storage_mask;
+				break;
+			case rsx::vertex_base_type::ub:
+			case rsx::vertex_base_type::ub256:
+				if (!is_be_type) attributes |= swap_storage_mask;
+				break;
+			}
+
+			buffer[index * 4 + 0] = static_cast<s32>(type);
+			buffer[index * 4 + 1] = size;
+			buffer[index * 4 + 2] = offset_in_block[index];
+			buffer[index * 4 + 3] = attributes;
+		}
 	}
 
-	bool thread::vertex_upload_task_ready()
+	void thread::write_vertex_data_to_memory(vertex_input_layout &layout, const u32 first_vertex, const u32 vertex_count, void *persistent_data, void *volatile_data)
 	{
-		if (g_cfg.video.vertex_upload_threads < 2)
-			return false;
+		char *transient = (char *)volatile_data;
+		char *persistent = (char *)persistent_data;
 
-		return (m_vertex_streaming_task.remaining_packets == 0 && m_vertex_streaming_task.ready_threads == 0);
+		auto &draw_call = rsx::method_registers.current_draw_clause;
+
+		if (transient != nullptr)
+		{
+			if (draw_call.command == rsx::draw_command::inlined_array)
+			{
+				memcpy(transient, draw_call.inline_vertex_array.data(), draw_call.inline_vertex_array.size() * sizeof(u32));
+				//Is it possible to reference data outside of the inlined array?
+				return;
+			}
+
+			for (const u8 index : layout.referenced_registers)
+			{
+				memcpy(transient, rsx::method_registers.register_vertex_info[index].data.data(), 16);
+				transient += 16;
+			}
+
+			if (draw_call.is_immediate_draw)
+			{
+				//NOTE: It is possible for immediate draw to only contain index data, so vertex data can be in persistent memory
+				for (const auto &info : layout.volatile_blocks)
+				{
+					memcpy(transient, vertex_push_buffers[info.first].data.data(), info.second);
+					transient += info.second;
+				}
+			}
+		}
+
+		if (persistent != nullptr)
+		{
+			for (const auto &block : layout.interleaved_blocks)
+			{
+				u32 unique_verts;
+				u32 vertex_base = first_vertex * block.attribute_stride;
+
+				if (block.single_vertex)
+				{
+					unique_verts = 1;
+				}
+				else if (block.min_divisor > 1)
+				{
+					if (block.all_modulus)
+						unique_verts = block.min_divisor;
+					else
+					{
+						unique_verts = vertex_count / block.min_divisor;
+						if (vertex_count % block.min_divisor) unique_verts++;
+					}
+				}
+				else
+				{
+					unique_verts = vertex_count;
+				}
+
+				const u32 data_size = block.attribute_stride * unique_verts;
+				memcpy(persistent, (char*)vm::base(block.real_offset_address) + vertex_base, data_size);
+				persistent += data_size;
+			}
+		}
 	}
 
 	void thread::flip(int buffer)

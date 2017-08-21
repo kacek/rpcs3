@@ -40,7 +40,7 @@ public:
 
 	Buffer(QWidget* parent, bool isTex, u32 id = 4)
 		: QWidget(parent), m_isTex(isTex), m_id(id){};
-	void showImage(QImage image = QImage());
+	void showImage(const QImage& image = QImage());
 
 private:
 	void mouseDoubleClickEvent(QMouseEvent* event);
@@ -60,7 +60,7 @@ class rsx_debugger : public QDialog
 	u32 pSize;
 
 	QLineEdit* t_addr;
-	QPalette* palette_bg;
+	QPalette palette_bg;
 	QFont mono;
 	QFontMetrics* fontMetrics;
 

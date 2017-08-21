@@ -471,6 +471,12 @@ s32 _ZN4cxml8DocumentD1Ev()
 	return CELL_OK;
 }
 
+s32 _ZN4cxml8Document5ClearEv()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
 s32 _ZN4cxml8Document13CreateElementEPKciPNS_7ElementE()
 {
 	UNIMPLEMENTED_FUNC(cellSysutil);
@@ -507,6 +513,12 @@ s32 _ZNK4cxml7Element12GetAttributeEPKcPNS_9AttributeE()
 	return CELL_OK;
 }
 
+s32 _ZNK4cxml7Element13GetFirstChildEv()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
 s32 _ZNK4cxml7Element14GetNextSiblingEv()
 {
 	UNIMPLEMENTED_FUNC(cellSysutil);
@@ -537,6 +549,12 @@ s32 _ZN8cxmlutil6GetIntERKN4cxml7ElementEPKcPi()
 	return CELL_OK;
 }
 
+s32 _ZN8cxmlutil8GetFloatERKN4cxml7ElementEPKcPf()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
 s32 _ZN8cxmlutil9GetStringERKN4cxml7ElementEPKcPS5_Pj()
 {
 	UNIMPLEMENTED_FUNC(cellSysutil);
@@ -562,6 +580,36 @@ s32 _ZN8cxmlutil16FindChildElementERKN4cxml7ElementEPKcS5_S5_()
 }
 
 s32 _ZN8cxmlutil7GetFileERKN4cxml7ElementEPKcPNS0_4FileE()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
+s32 _ZN16sysutil_cxmlutil11FixedMemory3EndEi()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
+s32 _ZN16sysutil_cxmlutil11FixedMemory5BeginEi()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
+s32 _ZN16sysutil_cxmlutil11FixedMemory8AllocateEN4cxml14AllocationTypeEPvS3_jPS3_Pj()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
+s32 _ZN16sysutil_cxmlutil12PacketWriter5WriteEPKvjPv()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
+s32 _ZN16sysutil_cxmlutil12PacketWriterC1EiiRN4cxml8DocumentE()
 {
 	UNIMPLEMENTED_FUNC(cellSysutil);
 	return CELL_OK;
@@ -636,6 +684,7 @@ DECLARE(ppu_module_manager::cellSysutil)("cellSysutil", []()
 
 	REG_FUNC(cellSysutil, _ZN4cxml8DocumentC1Ev);
 	REG_FUNC(cellSysutil, _ZN4cxml8DocumentD1Ev);
+	REG_FUNC(cellSysutil, _ZN4cxml8Document5ClearEv);
 	REG_FUNC(cellSysutil, _ZN4cxml8Document13CreateElementEPKciPNS_7ElementE);
 	REG_FUNC(cellSysutil, _ZN4cxml8Document14SetHeaderMagicEPKc);
 	REG_FUNC(cellSysutil, _ZN4cxml8Document16CreateFromBufferEPKvjb);
@@ -643,17 +692,25 @@ DECLARE(ppu_module_manager::cellSysutil)("cellSysutil", []()
 
 	REG_FUNC(cellSysutil, _ZNK4cxml4File7GetAddrEv);
 	REG_FUNC(cellSysutil, _ZNK4cxml7Element12GetAttributeEPKcPNS_9AttributeE);
+	REG_FUNC(cellSysutil, _ZNK4cxml7Element13GetFirstChildEv);
 	REG_FUNC(cellSysutil, _ZNK4cxml7Element14GetNextSiblingEv);
 	REG_FUNC(cellSysutil, _ZNK4cxml9Attribute6GetIntEPi);
 	REG_FUNC(cellSysutil, _ZNK4cxml9Attribute7GetFileEPNS_4FileE);
 
 	REG_FUNC(cellSysutil, _ZN8cxmlutil6SetIntERKN4cxml7ElementEPKci);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil6GetIntERKN4cxml7ElementEPKcPi);
+	REG_FUNC(cellSysutil, _ZN8cxmlutil8GetFloatERKN4cxml7ElementEPKcPf);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil9GetStringERKN4cxml7ElementEPKcPS5_Pj);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil9SetStringERKN4cxml7ElementEPKcS5_);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil16CheckElementNameERKN4cxml7ElementEPKc);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil16FindChildElementERKN4cxml7ElementEPKcS5_S5_);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil7GetFileERKN4cxml7ElementEPKcPNS0_4FileE);
-
+	
+	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil11FixedMemory3EndEi);
+	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil11FixedMemory5BeginEi);
+	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil11FixedMemory8AllocateEN4cxml14AllocationTypeEPvS3_jPS3_Pj);
+	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil12PacketWriter5WriteEPKvjPv);
+	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil12PacketWriterC1EiiRN4cxml8DocumentE);
+	
 	REG_FNID(cellSysutil, 0xE1EC7B6A, cellSysutil_E1EC7B6A);
 });

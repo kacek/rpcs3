@@ -329,7 +329,7 @@ void D3D12GSRender::end()
 	std::chrono::time_point<steady_clock> program_load_end = steady_clock::now();
 	m_timers.program_load_duration += std::chrono::duration_cast<std::chrono::microseconds>(program_load_end - program_load_start).count();
 
-	if (!m_fragment_program.valid)
+	if (!current_fragment_program.valid)
 	{
 		rsx::thread::end();
 		return;
@@ -523,10 +523,9 @@ void D3D12GSRender::flip(int buffer)
 		size_t offset = 0;
 		if (false)
 		{
-			CellGcmDisplayInfo* buffers = nullptr;// = vm::ps3::_ptr<CellGcmDisplayInfo>(m_gcm_buffers_addr);
-			u32 addr = rsx::get_address(gcm_buffers[gcm_current_buffer].offset, CELL_GCM_LOCATION_LOCAL);
-			w = gcm_buffers[gcm_current_buffer].width;
-			h = gcm_buffers[gcm_current_buffer].height;
+			u32 addr = rsx::get_address(display_buffers[current_display_buffer].offset, CELL_GCM_LOCATION_LOCAL);
+			w = display_buffers[current_display_buffer].width;
+			h = display_buffers[current_display_buffer].height;
 			u8 *src_buffer = vm::ps3::_ptr<u8>(addr);
 
 			row_pitch = align(w * 4, 256);

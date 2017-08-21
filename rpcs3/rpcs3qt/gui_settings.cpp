@@ -20,9 +20,7 @@ gui_settings::~gui_settings()
 
 QString gui_settings::ComputeSettingsDir()
 {
-	QString path = QDir(QDir::currentPath()).relativeFilePath(QCoreApplication::applicationDirPath());
-	path += "/GuiConfigs/";
-	return path;
+	return QString::fromStdString(fs::get_config_dir()) + "/GuiConfigs/";
 }
 
 void gui_settings::ChangeToConfig(const QString& name)
@@ -299,5 +297,12 @@ QStringList gui_settings::GetStylesheetEntries()
 
 QString gui_settings::GetCurrentStylesheetPath()
 {
-	return settingsDir.absoluteFilePath(GetValue(GUI::m_currentStylesheet).toString() + ".qss");
+	QString stylesheet = GetValue(GUI::m_currentStylesheet).toString();
+
+	if (stylesheet == GUI::Default)
+	{
+		return "";
+	}
+
+	return settingsDir.absoluteFilePath(stylesheet + ".qss");
 }

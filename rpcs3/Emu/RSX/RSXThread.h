@@ -22,6 +22,8 @@
 #include "Utilities/variant.hpp"
 #include "define_new_memleakdetect.h"
 
+#include "Emu/Cell/lv2/sys_rsx.h"
+
 extern u64 get_system_time();
 
 extern bool user_asked_for_frame_capture;
@@ -103,6 +105,36 @@ namespace rsx
 		std::vector<u32> inline_vertex_array;
 	};
 
+	struct interleaved_range_info
+	{
+		bool interleaved = false;
+		bool all_modulus = false;
+		bool single_vertex = false;
+		u32  base_offset = 0;
+		u32  real_offset_address = 0;
+		u8   memory_location = 0;
+		u8   attribute_stride = 0;
+		u16  min_divisor = 0;
+
+		std::vector<u8> locations;
+	};
+
+	enum attribute_buffer_placement : u8
+	{
+		none = 0,
+		persistent = 1,
+		transient = 2
+	};
+
+	struct vertex_input_layout
+	{
+		std::vector<interleaved_range_info> interleaved_blocks;  //Interleaved blocks to be uploaded as-is
+		std::vector<std::pair<u8, u32>> volatile_blocks;  //Volatile data blocks (immediate draw vertex data for example)
+		std::vector<u8> referenced_registers;  //Volatile register data
+
+		std::array<attribute_buffer_placement, 16> attribute_placement;
+	};
+
 	class thread : public named_thread
 	{
 		std::shared_ptr<thread_ctrl> m_vblank_thread;
@@ -113,7 +145,7 @@ namespace rsx
 		std::vector<u32> element_push_buffer;
 
 	public:
-		CellGcmControl* ctrl = nullptr;
+		RsxDmaControl* ctrl = nullptr;
 
 		Timer timer_sync;
 
@@ -129,28 +161,27 @@ namespace rsx
 	public:
 		std::shared_ptr<class ppu_thread> intr_thread;
 
+		// I hate this flag, but until hle is closer to lle, its needed
+		bool isHLE{ false };
+
 		u32 ioAddress, ioSize;
 		u32 flip_status;
-		int flip_mode;
 		int debug_level;
-		int frequency_mode;
 
-		u32 tiles_addr;
-		u32 zculls_addr;
-		vm::ps3::ptr<CellGcmDisplayInfo> gcm_buffers = vm::null;
-		u32 gcm_buffers_count;
-		u32 gcm_current_buffer;
+		atomic_t<bool> requested_vsync{false};
+		atomic_t<bool> enable_second_vhandler{false};
+
+		RsxDisplayInfo display_buffers[8];
+		u32 display_buffers_count{0};
+		u32 current_display_buffer{0};
 		u32 ctxt_addr;
 		u32 label_addr;
 
 		u32 local_mem_addr, main_mem_addr;
-		bool strict_ordering[0x1000];
 
 		bool m_rtts_dirty;
 		bool m_transform_constants_dirty;
 		bool m_textures_dirty[16];
-		bool m_vertex_attribs_changed;
-		bool m_index_buffer_changed;
 
 	protected:
 		s32 m_skip_frame_ctr = 0;
@@ -158,14 +189,23 @@ namespace rsx
 	protected:
 		std::array<u32, 4> get_color_surface_addresses() const;
 		u32 get_zeta_surface_address() const;
-		RSXVertexProgram get_current_vertex_program() const;
+
+		/**
+		 * Analyze vertex inputs and group all interleaved blocks
+		 */
+		vertex_input_layout analyse_inputs_interleaved() const;
+
+		RSXVertexProgram current_vertex_program = {};
+		RSXFragmentProgram current_fragment_program = {};
+
+		void get_current_vertex_program();
 
 		/**
 		 * Gets current fragment program and associated fragment state
 		 * get_surface_info is a helper takes 2 parameters: rsx_texture_address and surface_is_depth
 		 * returns whether surface is a render target and surface pitch in native format
 		 */
-		RSXFragmentProgram get_current_fragment_program(std::function<std::tuple<bool, u16>(u32, fragment_texture&, bool)> get_surface_info) const;
+		void get_current_fragment_program(std::function<std::tuple<bool, u16>(u32, fragment_texture&, bool)> get_surface_info);
 	public:
 		double fps_limit = 59.94;
 
@@ -180,6 +220,12 @@ namespace rsx
 		std::set<u32> m_used_gcm_commands;
 		bool invalid_command_interrupt_raised = false;
 		bool in_begin_end = false;
+
+		bool conditional_render_test_failed = false;
+		bool conditional_render_enabled = false;
+		bool zcull_stats_enabled = false;
+		bool zcull_rendering_enabled = false;
+		bool zcull_pixel_cnt_enabled = false;
 
 	protected:
 		thread();
@@ -208,17 +254,23 @@ namespace rsx
 		virtual void flip(int buffer) = 0;
 		virtual u64 timestamp() const;
 		virtual bool on_access_violation(u32 /*address*/, bool /*is_writing*/) { return false; }
+		virtual void on_notify_memory_unmapped(u32 /*address_base*/, u32 /*size*/) {}
+
+		//zcull
+		virtual void notify_zcull_info_changed() {}
+		virtual void clear_zcull_stats(u32 /*type*/) {}
+		virtual u32 get_zcull_stats(u32 /*type*/) { return UINT32_MAX; }
 
 		gsl::span<const gsl::byte> get_raw_index_array(const std::vector<std::pair<u32, u32> >& draw_indexed_clause) const;
 		gsl::span<const gsl::byte> get_raw_vertex_buffer(const rsx::data_array_format_info&, u32 base_offset, const std::vector<std::pair<u32, u32>>& vertex_ranges) const;
 
 		std::vector<std::variant<vertex_array_buffer, vertex_array_register, empty_vertex_array>>
-		get_vertex_buffers(const rsx::rsx_state& state, const std::vector<std::pair<u32, u32>>& vertex_ranges) const;
+		get_vertex_buffers(const rsx::rsx_state& state, const std::vector<std::pair<u32, u32>>& vertex_ranges, const u64 consumed_attrib_mask) const;
 		
 		std::variant<draw_array_command, draw_indexed_array_command, draw_inlined_array>
 		get_draw_command(const rsx::rsx_state& state) const;
 
-		/*
+		/**
 		* Immediate mode rendering requires a temp push buffer to hold attrib values
 		* Appends a value to the push buffer (currently only supports 32-wide types)
 		*/
@@ -229,42 +281,24 @@ namespace rsx
 		u32 get_push_buffer_index_count() const;
 
 	protected:
-		//Save draw call parameters to detect instanced renders
-		std::pair<u32, u32> m_last_first_count;
-		rsx::draw_command m_last_command;
 
-		bool is_probable_instanced_draw();
+		/**
+		 * Computes VRAM requirements needed to upload raw vertex streams
+		 * result.first contains persistent memory requirements
+		 * result.second contains volatile memory requirements
+		 */
+		std::pair<u32, u32> calculate_memory_requirements(vertex_input_layout& layout, const u32 vertex_count);
 
-	public:
-		//MT vertex streaming
-		struct upload_stream_packet
-		{
-			std::function<void(void *, rsx::vertex_base_type, u8, u32)> post_upload_func;
-			gsl::span<const gsl::byte> src_span;
-			gsl::span<gsl::byte> dst_span;
-			rsx::vertex_base_type type;
-			u32 vector_width;
-			u32 src_stride;
-			u8 dst_stride;
-		};
+		/**
+		 * Generates vertex input descriptors as an array of 16x4 s32s
+		 */
+		void fill_vertex_layout_state(vertex_input_layout& layout, const u32 vertex_count, s32* buffer);
 
-		struct upload_stream_task
-		{
-			std::vector<upload_stream_packet> packets;
-			std::atomic<int> remaining_packets = { 0 };
-			std::atomic<int> ready_threads = { 0 };
-			std::atomic<u32> vertex_count;
-
-			std::vector<std::shared_ptr<thread_ctrl>> processing_threads;
-		};
-
-		upload_stream_task m_vertex_streaming_task;
-		void post_vertex_stream_to_upload(gsl::span<const gsl::byte> src, gsl::span<gsl::byte> dst, rsx::vertex_base_type type,
-				u32 vector_element_count, u32 attribute_src_stride, u8 dst_stride,
-			std::function<void(void *, rsx::vertex_base_type, u8, u32)> callback);
-		void start_vertex_upload_task(u32 vertex_count);
-		void wait_for_vertex_upload_task();
-		bool vertex_upload_task_ready();
+		/**
+		 * Uploads vertex data described in the layout descriptor
+		 * Copies from local memory to the write-only output buffers provided in a sequential manner
+		 */
+		void write_vertex_data_to_memory(vertex_input_layout &layout, const u32 first_vertex, const u32 vertex_count, void *persistent_data, void *volatile_data);
 
 	private:
 		std::mutex m_mtx_task;
@@ -340,7 +374,7 @@ namespace rsx
 
 	public:
 		void reset();
-		void init(const u32 ioAddress, const u32 ioSize, const u32 ctrlAddress, const u32 localAddress);
+		void init(u32 ioAddress, u32 ioSize, u32 ctrlAddress, u32 localAddress);
 
 		tiled_region get_tiled_address(u32 offset, u32 location);
 		GcmTileInfo *find_tile(u32 offset, u32 location);

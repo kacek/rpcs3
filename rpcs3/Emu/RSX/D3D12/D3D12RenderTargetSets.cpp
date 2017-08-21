@@ -175,9 +175,16 @@ void D3D12GSRender::prepare_render_targets(ID3D12GraphicsCommandList *copycmdlis
 		rsx::method_registers.clear_color_b() / 255.f,
 		rsx::method_registers.clear_color_a() / 255.f,
 	};
+
+	u32 clip_width = rsx::method_registers.surface_clip_width();
+	u32 clip_height = rsx::method_registers.surface_clip_height();
+
+	if (clip_height == 0 || clip_width == 0)
+		return;
+
 	m_rtts.prepare_render_target(copycmdlist,
 		rsx::method_registers.surface_color(), rsx::method_registers.surface_depth_fmt(),
-		rsx::method_registers.surface_clip_width(), rsx::method_registers.surface_clip_height(),
+		clip_width, clip_height,
 		rsx::method_registers.surface_color_target(),
 		get_color_surface_addresses(), get_zeta_surface_address(),
 		m_device.Get(), clear_color, 1.f, 0);
@@ -291,6 +298,9 @@ void D3D12GSRender::copy_render_target_to_dma_location()
 	int clip_w = rsx::method_registers.surface_clip_width();
 	int clip_h = rsx::method_registers.surface_clip_height();
 
+	if (clip_w == 0 || clip_h == 0)
+		return;
+
 	size_t depth_row_pitch = align(clip_w * 4, 256);
 	size_t depth_buffer_offset_in_heap = 0;
 
@@ -322,7 +332,7 @@ void D3D12GSRender::copy_render_target_to_dma_location()
 	{
 		for (u8 i : get_rtt_indexes(rsx::method_registers.surface_color_target()))
 		{
-			if (!address_color[i])
+			if (!address_color[i] || std::get<1>(m_rtts.m_bound_render_targets[i]) == nullptr)
 				continue;
 			color_buffer_offset_in_heap[i] = download_to_readback_buffer(m_device.Get(), get_current_resource_storage().command_list.Get(), m_readback_resources, std::get<1>(m_rtts.m_bound_render_targets[i]), rsx::method_registers.surface_color());
 			invalidate_address(address_color[i]);
@@ -374,7 +384,7 @@ void D3D12GSRender::copy_render_target_to_dma_location()
 
 		for (u8 i : get_rtt_indexes(rsx::method_registers.surface_color_target()))
 		{
-			if (!address_color[i])
+			if (!address_color[i] || std::get<1>(m_rtts.m_bound_render_targets[i]) == nullptr)
 				continue;
 			copy_readback_buffer_to_dest(dest_buffer[i], m_readback_resources, color_buffer_offset_in_heap[i], srcPitch, dstPitch, clip_h);
 		}

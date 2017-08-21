@@ -42,7 +42,7 @@ namespace
 		fmt::throw_exception("Wrong vector size %d" HERE, size);
 	}
 
-	u32 get_vertex_count(const std::vector<std::pair<u32, u32> > first_count_commands)
+	u32 get_vertex_count(const std::vector<std::pair<u32, u32> >& first_count_commands)
 	{
 		u32 vertex_count = 0;
 		for (const auto &pair : first_count_commands)
@@ -89,7 +89,7 @@ void D3D12GSRender::upload_and_bind_scale_offset_matrix(size_t descriptorIndex)
 	void *mapped_buffer = m_buffer_data.map<void>(CD3DX12_RANGE(heap_offset, heap_offset + 512));
 	fill_scale_offset_data(mapped_buffer, true);
 	fill_user_clip_data((char*)mapped_buffer + 64);
-	fill_fragment_state_buffer((char *)mapped_buffer + 128, m_fragment_program);
+	fill_fragment_state_buffer((char *)mapped_buffer + 128, current_fragment_program);
 	m_buffer_data.unmap(CD3DX12_RANGE(heap_offset, heap_offset + 512));
 
 	D3D12_CONSTANT_BUFFER_VIEW_DESC constant_buffer_view_desc = {
@@ -124,7 +124,7 @@ void D3D12GSRender::upload_and_bind_vertex_shader_constants(size_t descriptor_in
 D3D12_CONSTANT_BUFFER_VIEW_DESC D3D12GSRender::upload_fragment_shader_constants()
 {
 	// Get constant from fragment program
-	size_t buffer_size = m_pso_cache.get_fragment_constants_buffer_size(m_fragment_program);
+	size_t buffer_size = m_pso_cache.get_fragment_constants_buffer_size(current_fragment_program);
 	// Multiple of 256 never 0
 	buffer_size = (buffer_size + 255) & ~255;
 
@@ -132,7 +132,7 @@ D3D12_CONSTANT_BUFFER_VIEW_DESC D3D12GSRender::upload_fragment_shader_constants(
 
 	size_t offset = 0;
 	float *mapped_buffer = m_buffer_data.map<float>(CD3DX12_RANGE(heap_offset, heap_offset + buffer_size));
-	m_pso_cache.fill_fragment_constants_buffer({ mapped_buffer, ::narrow<int>(buffer_size) }, m_fragment_program);
+	m_pso_cache.fill_fragment_constants_buffer({ mapped_buffer, ::narrow<int>(buffer_size) }, current_fragment_program);
 	m_buffer_data.unmap(CD3DX12_RANGE(heap_offset, heap_offset + buffer_size));
 
 	return {
@@ -468,7 +468,7 @@ D3D12GSRender::upload_and_set_vertex_index_data(ID3D12GraphicsCommandList* comma
 	return std::apply_visitor(
 		draw_command_visitor(command_list, m_buffer_data, m_vertex_buffer_data.Get(),
 			[this](
-				const auto& state, const auto& list) { return get_vertex_buffers(state, list); }),
+				const auto& state, const auto& list) { return get_vertex_buffers(state, list, 0); }),
 		get_draw_command(rsx::method_registers));
 }
 
