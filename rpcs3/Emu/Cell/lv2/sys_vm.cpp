@@ -2,7 +2,7 @@
 #include "sys_vm.h"
 #include "sys_memory.h"
 
-namespace vm { using namespace ps3; }
+
 
 logs::channel sys_vm("sys_vm");
 
@@ -21,7 +21,7 @@ error_code sys_vm_memory_map(u32 vsize, u32 psize, u32 cid, u64 flag, u64 policy
 	}
 
 	// Look for unmapped space (roughly)
-	for (u32 found = 0x60000000; found <= 0xC0000000 - vsize; found += 0x2000000)
+	for (u32 found = 0x40000000; found <= 0xC0000000 - vsize; found += 0x1000000)
 	{
 		// Try to map
 		if (const auto area = vm::map(found, vsize, flag))
@@ -102,8 +102,9 @@ error_code sys_vm_flush(u32 addr, u32 size)
 
 error_code sys_vm_invalidate(u32 addr, u32 size)
 {
-	sys_vm.todo("sys_vm_invalidate(addr=0x%x, size=0x%x)", addr, size);
+	sys_vm.warning("sys_vm_invalidate(addr=0x%x, size=0x%x)", addr, size);
 
+	std::memset(vm::base(addr), 0, size);
 	return CELL_OK;
 }
 

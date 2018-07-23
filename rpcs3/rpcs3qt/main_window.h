@@ -18,7 +18,8 @@
 
 #include <memory>
 
-namespace Ui {
+namespace Ui
+{
 	class main_window;
 }
 
@@ -29,42 +30,53 @@ class main_window : public QMainWindow
 	Ui::main_window *ui;
 
 	bool m_sys_menu_opened;
+	bool m_is_list_mode = true;
 	bool m_save_slider_pos = false;
+	int m_other_slider_pos = 0;
 
-	Render_Creator m_Render_Creator;
-
-	QIcon appIcon;
-	QIcon icon_play;
-	QIcon icon_pause;
-	QIcon icon_stop;
-	QIcon icon_restart;
-	QIcon icon_fullscreen_on;
-	QIcon icon_fullscreen_off;
+	QIcon m_appIcon;
+	QIcon m_icon_play;
+	QIcon m_icon_pause;
+	QIcon m_icon_stop;
+	QIcon m_icon_restart;
+	QIcon m_icon_fullscreen_on;
+	QIcon m_icon_fullscreen_off;
 
 #ifdef _WIN32
-	QIcon icon_thumb_play;
-	QIcon icon_thumb_pause;
-	QIcon icon_thumb_stop;
-	QIcon icon_thumb_restart;
-	QWinThumbnailToolBar *thumb_bar;
-	QWinThumbnailToolButton *thumb_playPause;
-	QWinThumbnailToolButton *thumb_stop;
-	QWinThumbnailToolButton *thumb_restart;
+	QIcon m_icon_thumb_play;
+	QIcon m_icon_thumb_pause;
+	QIcon m_icon_thumb_stop;
+	QIcon m_icon_thumb_restart;
+	QWinThumbnailToolBar *m_thumb_bar = nullptr;
+	QWinThumbnailToolButton *m_thumb_playPause = nullptr;
+	QWinThumbnailToolButton *m_thumb_stop = nullptr;
+	QWinThumbnailToolButton *m_thumb_restart = nullptr;
 	QStringList m_vulkan_adapters;
 #endif
 #ifdef _MSC_VER
 	QStringList m_d3d12_adapters;
 #endif
 
+	enum drop_type
+	{
+		drop_error,
+		drop_pkg,
+		drop_pup,
+		drop_rap,
+		drop_dir,
+		drop_game,
+		drop_rrc
+	};
+
 public:
-	explicit main_window(std::shared_ptr<gui_settings> guiSettings, QWidget *parent = 0);
+	explicit main_window(std::shared_ptr<gui_settings> guiSettings, std::shared_ptr<emu_settings> emuSettings, QWidget *parent = 0);
 	void Init();
 	~main_window();
-	void CreateThumbnailToolbar();
 	QIcon GetAppIcon();
 
 Q_SIGNALS:
 	void RequestGlobalStylesheetChange(const QString& sheetFilePath);
+	void RequestTrophyManagerRepaint();
 
 public Q_SLOTS:
 	void OnEmuStop();
@@ -73,28 +85,42 @@ public Q_SLOTS:
 	void OnEmuPause();
 	void OnEmuReady();
 
+	void RepaintGui();
+
 private Q_SLOTS:
+	void OnPlayOrPause();
+	void Boot(const std::string& path, bool direct = false, bool add_only = false);
 	void BootElf();
 	void BootGame();
+	void BootRsxCapture(std::string path = "");
 	void DecryptSPRXLibraries();
 
 	void SaveWindowState();
-	void RepaintToolBarIcons();
+	void ConfigureGuiFromSettings(bool configure_all = false);
+	void SetIconSizeActions(int idx);
+	void ResizeIcons(int index);
 
 protected:
 	void closeEvent(QCloseEvent *event) override;
 	void keyPressEvent(QKeyEvent *keyEvent) override;
 	void mouseDoubleClickEvent(QMouseEvent *event) override;
-	void SetAppIconFromPath(const std::string path);
+	void dropEvent(QDropEvent* event) override;
+	void dragEnterEvent(QDragEnterEvent* event) override;
+	void dragMoveEvent(QDragMoveEvent* event) override;
+	void dragLeaveEvent(QDragLeaveEvent* event) override;
+	void SetAppIconFromPath(const std::string& path);
 private:
-	void RepaintToolbar();
+	void RepaintToolBarIcons();
+	void RepaintThumbnailIcons();
 	void CreateActions();
 	void CreateConnects();
 	void CreateDockWindows();
-	void ConfigureGuiFromSettings(bool configureAll = false);
 	void EnableMenus(bool enabled);
-	void InstallPkg(const QString& dropPath = "");
+	void InstallPkg(const QString& dropPath = "", bool is_bulk = false);
 	void InstallPup(const QString& dropPath = "");
+
+	int IsValidFile(const QMimeData& md, QStringList* dropPaths = nullptr);
+	void AddGamesFromDir(const QString& path);
 
 	QAction* CreateRecentAction(const q_string_pair& entry, const uint& sc_idx);
 	void BootRecentAction(const QAction* act);
@@ -103,14 +129,17 @@ private:
 	q_pair_list m_rg_entries;
 	QList<QAction*> m_recentGameActs;
 
-	QActionGroup* iconSizeActGroup;
-	QActionGroup* listModeActGroup;
-	QActionGroup* categoryVisibleActGroup;
+	QActionGroup* m_iconSizeActGroup;
+	QActionGroup* m_listModeActGroup;
+	QActionGroup* m_categoryVisibleActGroup;
+
+	QMessageBox::StandardButton m_install_bulk = QMessageBox::NoButton;
 
 	// Dockable widget frames
 	QMainWindow *m_mw;
-	log_frame *logFrame;
-	debugger_frame *debuggerFrame;
-	game_list_frame *gameListFrame;
+	log_frame *m_logFrame;
+	debugger_frame *m_debuggerFrame;
+	game_list_frame *m_gameListFrame;
 	std::shared_ptr<gui_settings> guiSettings;
+	std::shared_ptr<emu_settings> emuSettings;
 };

@@ -118,7 +118,7 @@ namespace cfg
 		bool m_value;
 
 	public:
-		const bool def;
+		bool def;
 
 		_bool(node* owner, const std::string& name, bool def = false)
 			: _base(type::_bool, owner, name)
@@ -128,6 +128,11 @@ namespace cfg
 		}
 
 		explicit operator bool() const
+		{
+			return m_value;
+		}
+
+		bool get() const
 		{
 			return m_value;
 		}
@@ -150,6 +155,11 @@ namespace cfg
 
 			return true;
 		}
+
+		void set(const bool& value)
+		{
+			m_value = value;
+		}
 	};
 
 	// Value node with fixed set of possible values, each maps to an enum value of type T.
@@ -169,6 +179,11 @@ namespace cfg
 		}
 
 		operator T() const
+		{
+			return m_value;
+		}
+
+		T get() const
 		{
 			return m_value;
 		}
@@ -217,7 +232,7 @@ namespace cfg
 		int_type m_value;
 
 	public:
-		const int_type def;
+		int_type def;
 
 		_int(node* owner, const std::string& name, int_type def = std::min<int_type>(Max, std::max<int_type>(Min, 0)))
 			: _base(type::_int, owner, name)
@@ -227,6 +242,11 @@ namespace cfg
 		}
 
 		operator int_type() const
+		{
+			return m_value;
+		}
+
+		int_type get() const
 		{
 			return m_value;
 		}
@@ -253,6 +273,11 @@ namespace cfg
 			return false;
 		}
 
+		void set(const s64& value)
+		{
+			m_value = static_cast<int_type>(value);
+		}
+
 		std::vector<std::string> to_list() const override
 		{
 			return make_int_range(Min, Max);
@@ -271,7 +296,7 @@ namespace cfg
 		std::string m_value;
 
 	public:
-		const std::string def;
+		std::string def;
 
 		string(node* owner, const std::string& name, const std::string& def = {})
 			: _base(type::string, owner, name)

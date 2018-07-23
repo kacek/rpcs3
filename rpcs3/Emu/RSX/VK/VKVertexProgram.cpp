@@ -15,15 +15,14 @@ std::string VKVertexDecompilerThread::getIntTypeName(size_t elementCount)
 	return "ivec4";
 }
 
-
 std::string VKVertexDecompilerThread::getFunction(FUNCTION f)
 {
-	return vk::getFunctionImpl(f);
+	return glsl::getFunctionImpl(f);
 }
 
-std::string VKVertexDecompilerThread::compareFunction(COMPARE f, const std::string &Op0, const std::string &Op1)
+std::string VKVertexDecompilerThread::compareFunction(COMPARE f, const std::string &Op0, const std::string &Op1, bool scalar)
 {
-	return glsl::compareFunctionImpl(f, Op0, Op1);
+	return glsl::compareFunctionImpl(f, Op0, Op1, scalar);
 }
 
 void VKVertexDecompilerThread::insertHeader(std::stringstream &OS)
@@ -37,6 +36,9 @@ void VKVertexDecompilerThread::insertHeader(std::stringstream &OS)
 	OS << "	vec4 user_clip_factor[2];\n";
 	OS << "	uint transform_branch_bits;\n";
 	OS << "	uint vertex_base_index;\n";
+	OS << "	float point_size;\n";
+	OS << "	float z_near;\n";
+	OS << "	float z_far;\n";
 	OS << "	ivec4 input_attributes[16];\n";
 	OS << "};\n";
 
@@ -148,7 +150,7 @@ void VKVertexDecompilerThread::insertOutputs(std::stringstream & OS, const std::
 
 	for (auto &i : reg_table)
 	{
-		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", i.src_reg) && i.need_declare)
+		if (m_parr.HasParam(PF_PARAM_OUT, "vec4", i.src_reg) && i.need_declare)
 		{
 			if (i.check_mask && (rsx_vertex_program.output_mask & i.check_mask_value) == 0)
 				continue;
@@ -183,14 +185,14 @@ void VKVertexDecompilerThread::insertOutputs(std::stringstream & OS, const std::
 
 void VKVertexDecompilerThread::insertMainStart(std::stringstream & OS)
 {
-	glsl::insert_glsl_legacy_function(OS, glsl::glsl_vertex_program);
+	glsl::insert_glsl_legacy_function(OS, glsl::glsl_vertex_program, properties.has_lit_op);
 	glsl::insert_vertex_input_fetch(OS, glsl::glsl_rules_rpirv);
 
 	std::string parameters = "";
 	for (int i = 0; i < 16; ++i)
 	{
 		std::string reg_name = "dst_reg" + std::to_string(i);
-		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", reg_name))
+		if (m_parr.HasParam(PF_PARAM_OUT, "vec4", reg_name))
 		{
 			if (parameters.length())
 				parameters += ", ";
@@ -236,7 +238,7 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 
 	std::string parameters = "";
 
-	if (ParamType *vec4Types = m_parr.SearchParam(PF_PARAM_NONE, "vec4"))
+	if (ParamType *vec4Types = m_parr.SearchParam(PF_PARAM_OUT, "vec4"))
 	{
 		for (int i = 0; i < 16; ++i)
 		{
@@ -270,7 +272,7 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 
 	for (auto &i : reg_table)
 	{
-		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", i.src_reg))
+		if (m_parr.HasParam(PF_PARAM_OUT, "vec4", i.src_reg))
 		{
 			if (i.check_mask && (rsx_vertex_program.output_mask & i.check_mask_value) == 0)
 				continue;
@@ -303,14 +305,16 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 	}
 
 	if (insert_back_diffuse && insert_front_diffuse)
-		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", "dst_reg1"))
+		if (m_parr.HasParam(PF_PARAM_OUT, "vec4", "dst_reg1"))
 			OS << "	front_diff_color = dst_reg1;\n";
 
 	if (insert_back_specular && insert_front_specular)
-		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", "dst_reg2"))
+		if (m_parr.HasParam(PF_PARAM_OUT, "vec4", "dst_reg2"))
 			OS << "	front_spec_color = dst_reg2;\n";
 
+	OS << "	gl_PointSize = point_size;\n";
 	OS << "	gl_Position = gl_Position * scale_offset_mat;\n";
+	OS << "	gl_Position = apply_zclip_xform(gl_Position, z_near, z_far);\n";
 	OS << "}\n";
 }
 
@@ -332,43 +336,22 @@ VKVertexProgram::~VKVertexProgram()
 
 void VKVertexProgram::Decompile(const RSXVertexProgram& prog)
 {
-	VKVertexDecompilerThread decompiler(prog, shader, parr, *this);
+	std::string source;
+	VKVertexDecompilerThread decompiler(prog, source, parr, *this);
 	decompiler.Task();
+
+	shader.create(::glsl::program_domain::glsl_vertex_program, source);
 }
 
 void VKVertexProgram::Compile()
 {
-	fs::create_path(fs::get_config_dir() + "/shaderlog");
-	fs::file(fs::get_config_dir() + "shaderlog/VertexProgram.spirv", fs::rewrite).write(shader);
-
-	std::vector<u32> spir_v;
-	if (!vk::compile_glsl_to_spv(shader, glsl::glsl_vertex_program, spir_v))
-		fmt::throw_exception("Failed to compile vertex shader" HERE);
-
-	VkShaderModuleCreateInfo vs_info;
-	vs_info.codeSize = spir_v.size() * sizeof(u32);
-	vs_info.pNext = nullptr;
-	vs_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-	vs_info.pCode = (uint32_t*)spir_v.data();
-	vs_info.flags = 0;
-
-	VkDevice dev = (VkDevice)*vk::get_current_renderer();
-	vkCreateShaderModule(dev, &vs_info, nullptr, &handle);
-
-	id = UINT32_MAX;
+	fs::file(fs::get_config_dir() + "shaderlog/VertexProgram" + std::to_string(id) + ".spirv", fs::rewrite).write(shader.get_source());
+	handle = shader.compile();
 }
 
 void VKVertexProgram::Delete()
 {
-	shader.clear();
-
-	if (handle)
-	{
-		VkDevice dev = (VkDevice)*vk::get_current_renderer();
-		vkDestroyShaderModule(dev, handle, nullptr);
-
-		handle = nullptr;
-	}
+	shader.destroy();
 }
 
 void VKVertexProgram::SetInputs(std::vector<vk::glsl::program_input>& inputs)

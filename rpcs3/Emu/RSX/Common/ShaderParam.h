@@ -18,18 +18,24 @@ enum class FUNCTION {
 	FUNCTION_DFDY,
 	FUNCTION_REFL,
 	FUNCTION_TEXTURE_SAMPLE1D,
+	FUNCTION_TEXTURE_SAMPLE1D_BIAS,
 	FUNCTION_TEXTURE_SAMPLE1D_PROJ,
 	FUNCTION_TEXTURE_SAMPLE1D_LOD,
 	FUNCTION_TEXTURE_SAMPLE1D_GRAD,
 	FUNCTION_TEXTURE_SAMPLE2D,
+	FUNCTION_TEXTURE_SAMPLE2D_BIAS,
 	FUNCTION_TEXTURE_SAMPLE2D_PROJ,
 	FUNCTION_TEXTURE_SAMPLE2D_LOD,
 	FUNCTION_TEXTURE_SAMPLE2D_GRAD,
+	FUNCTION_TEXTURE_SHADOW2D,
+	FUNCTION_TEXTURE_SHADOW2D_PROJ,
 	FUNCTION_TEXTURE_SAMPLECUBE,
+	FUNCTION_TEXTURE_SAMPLECUBE_BIAS,
 	FUNCTION_TEXTURE_SAMPLECUBE_PROJ,
 	FUNCTION_TEXTURE_SAMPLECUBE_LOD,
 	FUNCTION_TEXTURE_SAMPLECUBE_GRAD,
 	FUNCTION_TEXTURE_SAMPLE3D,
+	FUNCTION_TEXTURE_SAMPLE3D_BIAS,
 	FUNCTION_TEXTURE_SAMPLE3D_PROJ,
 	FUNCTION_TEXTURE_SAMPLE3D_LOD,
 	FUNCTION_TEXTURE_SAMPLE3D_GRAD,
@@ -171,7 +177,20 @@ public:
 	ShaderVariable() = default;
 	ShaderVariable(const std::string& var)
 	{
-		auto var_blocks = fmt::split(var, { "." });
+		// Separate 'double destination' variables 'X=Y=SRC'
+		std::string simple_var;
+		const auto pos = var.find('=');
+
+		if (pos != std::string::npos)
+		{
+			simple_var = var.substr(0, pos - 1);
+		}
+		else
+		{
+			simple_var = var;
+		}
+
+		auto var_blocks = fmt::split(simple_var, { "." });
 
 		verify(HERE), (var_blocks.size() != 0);
 
@@ -192,7 +211,7 @@ public:
 		return swizzles[swizzles.size() - 1].length();
 	}
 
-	ShaderVariable& symplify()
+	ShaderVariable& simplify()
 	{
 		std::unordered_map<char, char> swizzle;
 

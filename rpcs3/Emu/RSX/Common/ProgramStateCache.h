@@ -6,6 +6,9 @@
 
 #include "Utilities/GSL.h"
 #include "Utilities/hash.h"
+#include "Utilities/mutex.h"
+
+#include <deque>
 
 enum class SHADER_TYPE
 {
@@ -24,7 +27,21 @@ namespace program_hash_util
 		u32 word[4];
 	};
 
-	struct vertex_program_hash
+	struct vertex_program_utils
+	{
+		struct vertex_program_metadata
+		{
+			std::bitset<512> instruction_mask;
+			u32 ucode_length;
+			u32 referenced_textures_mask;
+		};
+
+		static size_t get_vertex_program_ucode_hash(const RSXVertexProgram &program);
+
+		static vertex_program_metadata analyse_vertex_program(const u32* data, u32 entry, RSXVertexProgram& dst_prog);
+	};
+
+	struct vertex_program_storage_hash
 	{
 		size_t operator()(const RSXVertexProgram &program) const;
 	};
@@ -36,15 +53,26 @@ namespace program_hash_util
 
 	struct fragment_program_utils
 	{
+		struct fragment_program_metadata
+		{
+			u32 program_start_offset;
+			u32 program_ucode_length;
+			u16 referenced_textures_mask;
+		};
+
 		/**
 		* returns true if the given source Operand is a constant
 		*/
 		static bool is_constant(u32 sourceOperand);
 
 		static size_t get_fragment_program_ucode_size(void *ptr);
+
+		static fragment_program_metadata analyse_fragment_program(void *ptr);
+
+		static size_t get_fragment_program_ucode_hash(const RSXFragmentProgram &program);
 	};
 
-	struct fragment_program_hash
+	struct fragment_program_storage_hash
 	{
 		size_t operator()(const RSXFragmentProgram &program) const;
 	};
@@ -69,6 +97,7 @@ namespace program_hash_util
 * - static void recompile_fragment_program(RSXFragmentProgram *RSXFP, FragmentProgramData& fragmentProgramData, size_t ID);
 * - static void recompile_vertex_program(RSXVertexProgram *RSXVP, VertexProgramData& vertexProgramData, size_t ID);
 * - static PipelineData build_program(VertexProgramData &vertexProgramData, FragmentProgramData &fragmentProgramData, const PipelineProperties &pipelineProperties, const ExtraData& extraData);
+* - static void validate_pipeline_properties(const VertexProgramData &vertexProgramData, const FragmentProgramData &fragmentProgramData, PipelineProperties& props);
 */
 template<typename backend_traits>
 class program_state_cache
@@ -78,8 +107,8 @@ class program_state_cache
 	using vertex_program_type = typename backend_traits::vertex_program_type;
 	using fragment_program_type = typename backend_traits::fragment_program_type;
 
-	using binary_to_vertex_program = std::unordered_map<RSXVertexProgram, vertex_program_type, program_hash_util::vertex_program_hash, program_hash_util::vertex_program_compare> ;
-	using binary_to_fragment_program = std::unordered_map<RSXFragmentProgram, fragment_program_type, program_hash_util::fragment_program_hash, program_hash_util::fragment_program_compare>;
+	using binary_to_vertex_program = std::unordered_map<RSXVertexProgram, vertex_program_type, program_hash_util::vertex_program_storage_hash, program_hash_util::vertex_program_compare> ;
+	using binary_to_fragment_program = std::unordered_map<RSXFragmentProgram, fragment_program_type, program_hash_util::fragment_program_storage_hash, program_hash_util::fragment_program_compare>;
 
 
 	struct pipeline_key
@@ -109,21 +138,73 @@ class program_state_cache
 		}
 	};
 
+public:
+	struct async_link_task_entry
+	{
+		const vertex_program_type& vp;
+		const fragment_program_type& fp;
+		pipeline_properties props;
+
+		async_link_task_entry(const vertex_program_type& _V, const fragment_program_type& _F, const pipeline_properties& _P)
+			: vp(_V), fp(_F), props(_P)
+		{}
+	};
+
+	struct async_decompile_task_entry
+	{
+		RSXVertexProgram vp;
+		RSXFragmentProgram fp;
+		bool is_fp;
+
+		std::vector<u8> tmp_cache;
+
+		async_decompile_task_entry(const RSXVertexProgram& _V)
+			: vp(_V), is_fp(false)
+		{
+		}
+
+		async_decompile_task_entry(const RSXFragmentProgram& _F)
+			: fp(_F), is_fp(true)
+		{
+			tmp_cache.resize(fp.ucode_length);
+			std::memcpy(tmp_cache.data(), fp.addr, fp.ucode_length);
+			fp.addr = tmp_cache.data();
+		}
+	};
+
 protected:
+	shared_mutex m_pipeline_mutex;
+	shared_mutex m_decompiler_mutex;
+
 	size_t m_next_id = 0;
-	bool m_cache_miss_flag;
+	bool m_cache_miss_flag; // Set if last lookup did not find any usable cached programs
+	bool m_program_compiled_flag; // Set if last lookup caused program to be linked
+
 	binary_to_vertex_program m_vertex_shader_cache;
 	binary_to_fragment_program m_fragment_shader_cache;
 	std::unordered_map <pipeline_key, pipeline_storage_type, pipeline_key_hash, pipeline_key_compare> m_storage;
 
+	std::unordered_map <pipeline_key, std::unique_ptr<async_link_task_entry>, pipeline_key_hash, pipeline_key_compare> m_link_queue;
+	std::deque<async_decompile_task_entry> m_decompile_queue;
+
+	vertex_program_type __null_vertex_program;
+	fragment_program_type __null_fragment_program;
+	pipeline_storage_type __null_pipeline_handle;
+
 	/// bool here to inform that the program was preexisting.
-	std::tuple<const vertex_program_type&, bool> search_vertex_program(const RSXVertexProgram& rsx_vp)
+	std::tuple<const vertex_program_type&, bool> search_vertex_program(const RSXVertexProgram& rsx_vp, bool force_load = true)
 	{
 		const auto& I = m_vertex_shader_cache.find(rsx_vp);
 		if (I != m_vertex_shader_cache.end())
 		{
 			return std::forward_as_tuple(I->second, true);
 		}
+
+		if (!force_load)
+		{
+			return std::forward_as_tuple(__null_vertex_program, false);
+		}
+
 		LOG_NOTICE(RSX, "VP not found in buffer!");
 		vertex_program_type& new_shader = m_vertex_shader_cache[rsx_vp];
 		backend_traits::recompile_vertex_program(rsx_vp, new_shader, m_next_id++);
@@ -132,17 +213,22 @@ protected:
 	}
 
 	/// bool here to inform that the program was preexisting.
-	std::tuple<const fragment_program_type&, bool> search_fragment_program(const RSXFragmentProgram& rsx_fp)
+	std::tuple<const fragment_program_type&, bool> search_fragment_program(const RSXFragmentProgram& rsx_fp, bool force_load = true)
 	{
 		const auto& I = m_fragment_shader_cache.find(rsx_fp);
 		if (I != m_fragment_shader_cache.end())
 		{
 			return std::forward_as_tuple(I->second, true);
 		}
+
+		if (!force_load)
+		{
+			return std::forward_as_tuple(__null_fragment_program, false);
+		}
+
 		LOG_NOTICE(RSX, "FP not found in buffer!");
-		size_t fragment_program_size = program_hash_util::fragment_program_utils::get_fragment_program_ucode_size(rsx_fp.addr);
-		gsl::not_null<void*> fragment_program_ucode_copy = malloc(fragment_program_size);
-		std::memcpy(fragment_program_ucode_copy, rsx_fp.addr, fragment_program_size);
+		gsl::not_null<void*> fragment_program_ucode_copy = malloc(rsx_fp.ucode_length);
+		std::memcpy(fragment_program_ucode_copy, rsx_fp.addr, rsx_fp.ucode_length);
 		RSXFragmentProgram new_fp_key = rsx_fp;
 		new_fp_key.addr = fragment_program_ucode_copy;
 		fragment_program_type &new_shader = m_fragment_shader_cache[new_fp_key];
@@ -150,6 +236,77 @@ protected:
 
 		return std::forward_as_tuple(new_shader, false);
 	}
+
+public:
+
+	struct program_buffer_patch_entry
+	{
+		union
+		{
+			u32 hex_key;
+			f32 fp_key;
+		};
+
+		union
+		{
+			u32 hex_value;
+			f32 fp_value;
+		};
+
+		program_buffer_patch_entry()
+		{}
+
+		program_buffer_patch_entry(f32& key, f32& value)
+		{
+			fp_key = key;
+			fp_value = value;
+		}
+
+		program_buffer_patch_entry(u32& key, u32& value)
+		{
+			hex_key = key;
+			hex_value = value;
+		}
+
+		bool test_and_set(f32 value, f32* dst) const
+		{
+			u32 hex = (u32&)value;
+			if ((hex & 0x7FFFFFFF) == (hex_key & 0x7FFFFFFF))
+			{
+				hex = (hex & ~0x7FFFFFF) | hex_value;
+				*dst = (f32&)hex;
+				return true;
+			}
+
+			return false;
+		}
+	};
+
+	struct
+	{
+		std::unordered_map<f32, program_buffer_patch_entry> db;
+
+		void add(program_buffer_patch_entry& e)
+		{
+			db[e.fp_key] = e;
+		}
+
+		void add(f32& key, f32& value)
+		{
+			db[key] = { key, value };
+		}
+
+		void clear()
+		{
+			db.clear();
+		}
+
+		bool is_empty() const
+		{
+			return db.size() == 0;
+		}
+	}
+	patch_table;
 
 public:
 	program_state_cache() = default;
@@ -177,43 +334,177 @@ public:
 		fmt::throw_exception("Trying to get unknown shader program" HERE);
 	}
 
+	// Returns 2 booleans.
+	// First flag hints that there is more work to do (busy hint)
+	// Second flag is true if at least one program has been linked successfully (sync hint)
 	template<typename... Args>
-	pipeline_storage_type& getGraphicPipelineState(
+	std::pair<bool, bool> async_update(u32 max_decompile_count, Args&& ...args)
+	{
+		// Decompile shaders and link one pipeline object per 'run'
+		// NOTE: Linking is much slower than decompilation step, so always decompile at least 1 unit
+		// TODO: Use try_lock instead
+		bool busy = false;
+		{
+			u32 count = 0;
+			writer_lock lock(m_decompiler_mutex);
+
+			while (!m_decompile_queue.empty())
+			{
+				const auto& decompile_task = m_decompile_queue.front();
+				if (decompile_task.is_fp)
+				{
+					search_fragment_program(decompile_task.fp);
+				}
+				else
+				{
+					search_vertex_program(decompile_task.vp);
+				}
+
+				m_decompile_queue.pop_front();
+
+				if (++count >= max_decompile_count)
+				{
+					// Allows configurable decompiler 'load'
+					// Smaller unit count will release locks faster
+					busy = true;
+					break;
+				}
+			}
+		}
+
+		async_link_task_entry* link_entry;
+		pipeline_key key;
+		{
+			reader_lock lock(m_pipeline_mutex);
+			if (!m_link_queue.empty())
+			{
+				auto It = m_link_queue.begin();
+				link_entry = It->second.get();
+				key = It->first;
+			}
+			else
+			{
+				return { busy, false };
+			}
+		}
+
+		pipeline_storage_type pipeline = backend_traits::build_pipeline(link_entry->vp, link_entry->fp, link_entry->props, std::forward<Args>(args)...);
+		LOG_SUCCESS(RSX, "New program compiled successfully");
+
+		writer_lock lock(m_pipeline_mutex);
+		m_storage[key] = std::move(pipeline);
+		m_link_queue.erase(key);
+
+		return { (busy || !m_link_queue.empty()), true };
+	}
+
+	template<typename... Args>
+	pipeline_storage_type& get_graphics_pipeline(
 		const RSXVertexProgram& vertexShader,
 		const RSXFragmentProgram& fragmentShader,
-		const pipeline_properties& pipelineProperties,
+		pipeline_properties& pipelineProperties,
+		bool allow_async,
 		Args&& ...args
 		)
 	{
-		// TODO : use tie and implicit variable declaration syntax with c++17
-		const auto &vp_search = search_vertex_program(vertexShader);
-		const auto &fp_search = search_fragment_program(fragmentShader);
-		const vertex_program_type &vertex_program = std::get<0>(vp_search);
-		const fragment_program_type &fragment_program = std::get<0>(fp_search);
-		bool already_existing_fragment_program = std::get<1>(fp_search);
-		bool already_existing_vertex_program = std::get<1>(vp_search);
+		const auto &vp_search = search_vertex_program(vertexShader, !allow_async);
+		const auto &fp_search = search_fragment_program(fragmentShader, !allow_async);
 
-		pipeline_key key = { vertex_program.id, fragment_program.id, pipelineProperties };
+		const bool already_existing_fragment_program = std::get<1>(fp_search);
+		const bool already_existing_vertex_program = std::get<1>(vp_search);
 
-		if (already_existing_fragment_program && already_existing_vertex_program)
+		bool link_only = false;
+		m_cache_miss_flag = true;
+		m_program_compiled_flag = false;
+
+		if (!allow_async || (already_existing_vertex_program && already_existing_fragment_program))
 		{
+			const vertex_program_type &vertex_program = std::get<0>(vp_search);
+			const fragment_program_type &fragment_program = std::get<0>(fp_search);
+
+			backend_traits::validate_pipeline_properties(vertex_program, fragment_program, pipelineProperties);
+			pipeline_key key = { vertex_program.id, fragment_program.id, pipelineProperties };
+
 			const auto I = m_storage.find(key);
 			if (I != m_storage.end())
 			{
 				m_cache_miss_flag = false;
 				return I->second;
 			}
+
+			if (allow_async)
+			{
+				// Programs already exist, only linking required
+				link_only = true;
+			}
+			else
+			{
+				LOG_NOTICE(RSX, "Add program (vp id = %d, fp id = %d)", vertex_program.id, fragment_program.id);
+				m_program_compiled_flag = true;
+
+				pipeline_storage_type pipeline = backend_traits::build_pipeline(vertex_program, fragment_program, pipelineProperties, std::forward<Args>(args)...);
+				writer_lock lock(m_pipeline_mutex);
+				auto &rtn = m_storage[key] = std::move(pipeline);
+				LOG_SUCCESS(RSX, "New program compiled successfully");
+				return rtn;
+			}
 		}
 
-		LOG_NOTICE(RSX, "Add program :");
-		LOG_NOTICE(RSX, "*** vp id = %d", vertex_program.id);
-		LOG_NOTICE(RSX, "*** fp id = %d", fragment_program.id);
+		verify(HERE), allow_async;
 
-		m_storage[key] = backend_traits::build_pipeline(vertex_program, fragment_program, pipelineProperties, std::forward<Args>(args)...);
-		m_cache_miss_flag = true;
+		if (link_only)
+		{
+			const vertex_program_type &vertex_program = std::get<0>(vp_search);
+			const fragment_program_type &fragment_program = std::get<0>(fp_search);
+			pipeline_key key = { vertex_program.id, fragment_program.id, pipelineProperties };
 
-		LOG_SUCCESS(RSX, "New program compiled successfully");
-		return m_storage[key];
+			reader_lock lock(m_pipeline_mutex);
+
+			if (m_link_queue.find(key) != m_link_queue.end())
+			{
+				// Already in queue
+				return __null_pipeline_handle;
+			}
+
+			LOG_NOTICE(RSX, "Add program (vp id = %d, fp id = %d)", vertex_program.id, fragment_program.id);
+			m_program_compiled_flag = true;
+
+			lock.upgrade();
+			m_link_queue[key] = std::make_unique<async_link_task_entry>(vertex_program, fragment_program, pipelineProperties);
+		}
+		else
+		{
+			reader_lock lock(m_decompiler_mutex);
+
+			auto vertex_program_found = std::find_if(m_decompile_queue.begin(), m_decompile_queue.end(), [&](const auto& V)
+			{
+				if (V.is_fp) return false;
+				return program_hash_util::vertex_program_compare()(V.vp, vertexShader);
+			});
+
+			auto fragment_program_found = std::find_if(m_decompile_queue.begin(), m_decompile_queue.end(), [&](const auto& F)
+			{
+				if (!F.is_fp) return false;
+				return program_hash_util::fragment_program_compare()(F.fp, fragmentShader);
+			});
+
+			const bool add_vertex_program = (vertex_program_found == m_decompile_queue.end());
+			const bool add_fragment_program = (fragment_program_found == m_decompile_queue.end());
+
+			if (add_vertex_program)
+			{
+				lock.upgrade();
+				m_decompile_queue.emplace_back(vertexShader);
+			}
+
+			if (add_fragment_program)
+			{
+				lock.upgrade();
+				m_decompile_queue.emplace_back(fragmentShader);
+			}
+		}
+
+		return __null_pipeline_handle;
 	}
 
 	size_t get_fragment_constants_buffer_size(const RSXFragmentProgram &fragmentShader) const
@@ -225,26 +516,60 @@ public:
 		return 0;
 	}
 
-	void fill_fragment_constants_buffer(gsl::span<f32, gsl::dynamic_range> dst_buffer, const RSXFragmentProgram &fragment_program) const
+	void fill_fragment_constants_buffer(gsl::span<f32, gsl::dynamic_range> dst_buffer, const RSXFragmentProgram &fragment_program, bool sanitize = false) const
 	{
 		const auto I = m_fragment_shader_cache.find(fragment_program);
 		if (I == m_fragment_shader_cache.end())
 			return;
-		__m128i mask = _mm_set_epi8(0xE, 0xF, 0xC, 0xD,
-			0xA, 0xB, 0x8, 0x9,
-			0x6, 0x7, 0x4, 0x5,
-			0x2, 0x3, 0x0, 0x1);
 
 		verify(HERE), (dst_buffer.size_bytes() >= ::narrow<int>(I->second.FragmentConstantOffsetCache.size()) * 16);
 
-		size_t offset = 0;
+		f32* dst = dst_buffer.data();
+		alignas(16) f32 tmp[4];
 		for (size_t offset_in_fragment_program : I->second.FragmentConstantOffsetCache)
 		{
-			void *data = (char*)fragment_program.addr + (u32)offset_in_fragment_program;
-			const __m128i &vector = _mm_loadu_si128((__m128i*)data);
-			const __m128i &shuffled_vector = _mm_shuffle_epi8(vector, mask);
-			_mm_stream_si128((__m128i*)dst_buffer.subspan(offset, 4).data(), shuffled_vector);
-			offset += sizeof(f32);
+			char* data = (char*)fragment_program.addr + (u32)offset_in_fragment_program;
+			const __m128i vector = _mm_loadu_si128((__m128i*)data);
+			const __m128i shuffled_vector = _mm_or_si128(_mm_slli_epi16(vector, 8), _mm_srli_epi16(vector, 8));
+
+			if (!patch_table.is_empty())
+			{
+				_mm_store_ps(tmp, _mm_castsi128_ps(shuffled_vector));
+				bool patched;
+
+				for (int i = 0; i < 4; ++i)
+				{
+					patched = false;
+					for (auto& e : patch_table.db)
+					{
+						//TODO: Use fp comparison with fabsf without hurting performance
+						patched = e.second.test_and_set(tmp[i], &dst[i]);
+						if (patched)
+						{
+							break;
+						}
+					}
+
+					if (!patched)
+					{
+						dst[i] = tmp[i];
+					}
+				}
+			}
+			else if (sanitize)
+			{
+				//Convert NaNs and Infs to 0
+				const auto masked = _mm_and_si128((__m128i&)shuffled_vector, _mm_set1_epi32(0x7fffffff));
+				const auto valid = _mm_cmplt_epi32(masked, _mm_set1_epi32(0x7f800000));
+				const auto result = _mm_and_si128((__m128i&)shuffled_vector, valid);
+				_mm_stream_si128((__m128i*)dst, (__m128i&)result);
+			}
+			else
+			{
+				_mm_stream_si128((__m128i*)dst, shuffled_vector);
+			}
+
+			dst += 4;
 		}
 	}
 

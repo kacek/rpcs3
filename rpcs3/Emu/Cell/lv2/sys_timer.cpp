@@ -11,7 +11,7 @@
 
 #include <thread>
 
-namespace vm { using namespace ps3; }
+
 
 logs::channel sys_timer("sys_timer");
 
@@ -45,7 +45,7 @@ void lv2_timer::on_task()
 				}
 
 				// Stop: oneshot or the event port was disconnected (TODO: is it correct?)
-				state = SYS_TIMER_STATE_STOP; 
+				state = SYS_TIMER_STATE_STOP;
 				continue;
 			}
 
@@ -81,7 +81,7 @@ error_code sys_timer_create(vm::ptr<u32> timer_id)
 		*timer_id = id;
 		return CELL_OK;
 	}
-	
+
 	return CELL_EAGAIN;
 }
 
@@ -146,7 +146,7 @@ error_code _sys_timer_start(u32 timer_id, u64 base_time, u64 period)
 		// Invalid oneshot (TODO: what will happen if both args are 0?)
 		return not_an_error(CELL_ETIMEDOUT);
 	}
-	
+
 	if (period && period < 100)
 	{
 		// Invalid periodic timer
@@ -294,14 +294,42 @@ error_code sys_timer_usleep(ppu_thread& ppu, u64 sleep_time)
 
 	sys_timer.trace("sys_timer_usleep(sleep_time=0x%llx)", sleep_time);
 
-	u64 passed = 0;
-
-	lv2_obj::sleep(ppu, std::max<u64>(1, sleep_time));
-
-	while (sleep_time >= passed)
+	if (sleep_time)
 	{
-		thread_ctrl::wait_for(std::max<u64>(1, sleep_time - passed));
-		passed = get_system_time() - ppu.start_time;
+#ifdef __linux__
+		constexpr u32 host_min_quantum = 100;
+#else
+		// Host scheduler quantum for windows (worst case)
+		// NOTE: On ps3 this function has very high accuracy
+		constexpr u32 host_min_quantum = 500;
+#endif
+
+		u64 passed = 0;
+		u64 remaining;
+
+		lv2_obj::sleep(ppu, sleep_time);
+
+		while (sleep_time >= passed)
+		{
+			remaining = sleep_time - passed;
+
+			if (remaining > host_min_quantum)
+			{
+				// Wait on multiple of min quantum for large durations
+				thread_ctrl::wait_for(remaining - (remaining % host_min_quantum));
+			}
+			else
+			{
+				// Try yielding. May cause long wake latency but helps weaker CPUs a lot by alleviating resource pressure
+				std::this_thread::yield();
+			}
+
+			passed = (get_system_time() - ppu.start_time);
+		}
+	}
+	else
+	{
+		lv2_obj::yield(ppu);
 	}
 
 	return CELL_OK;

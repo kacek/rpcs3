@@ -16,6 +16,7 @@ enum class ppu_cmd : u32
 	hle_call, // Execute function by index (arg)
 	initialize, // ppu_initialize()
 	sleep,
+	reset_stack, // resets stack address
 };
 
 // Formatting helper
@@ -30,11 +31,14 @@ public:
 	static const u32 id_step = 1;
 	static const u32 id_count = 2048;
 
+	virtual void on_spawn() override;
 	virtual void on_init(const std::shared_ptr<void>&) override;
 	virtual std::string get_name() const override;
 	virtual std::string dump() const override;
 	virtual void cpu_task() override;
 	virtual void cpu_sleep() override;
+	virtual void cpu_mem() override;
+	virtual void cpu_unmem() override;
 	virtual ~ppu_thread() override;
 
 	ppu_thread(const std::string& name, u32 prio = 0, u32 stack = 0x10000);
@@ -94,7 +98,7 @@ public:
 		u8 cnt{};  // 0..6
 	}
 	xer;
-	
+
 	/*
 		Saturation. A sticky status bit indicating that some field in a saturating instruction saturated since the last
 		time SAT was cleared. In other words when SAT = '1' it remains set to '1' until it is cleared to '0' by an
@@ -131,11 +135,11 @@ public:
 	u32 raddr{0}; // Reservation addr
 	u64 rtime{0};
 	u64 rdata{0}; // Reservation data
-	
+
 	atomic_t<u32> prio{0}; // Thread priority (0..3071)
 	const u32 stack_size; // Stack size
 	const u32 stack_addr; // Stack address
-	
+
 	atomic_t<u32> joiner{~0u}; // Joining thread (-1 if detached)
 
 	lf_fifo<atomic_t<cmd64>, 127> cmd_queue; // Command queue for asynchronous operations.
@@ -235,6 +239,20 @@ struct ppu_gpr_cast_impl<vm::_ref_base<T, AT>, void>
 	static inline vm::_ref_base<T, AT> from(const u64 reg)
 	{
 		return vm::cast(ppu_gpr_cast_impl<AT>::from(reg));
+	}
+};
+
+template <>
+struct ppu_gpr_cast_impl<vm::null_t, void>
+{
+	static inline u64 to(const vm::null_t& value)
+	{
+		return 0;
+	}
+
+	static inline vm::null_t from(const u64 reg)
+	{
+		return vm::null;
 	}
 };
 

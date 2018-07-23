@@ -91,9 +91,9 @@ struct fmt_unveil<T, std::enable_if_t<std::is_enum<T>::value>>
 template <typename T>
 struct fmt_unveil<T*, void>
 {
-	using type = const T*;
+	using type = std::add_const_t<T>*;
 
-	static inline u64 get(const T* arg)
+	static inline u64 get(type arg)
 	{
 		return reinterpret_cast<std::uintptr_t>(arg);
 	}
@@ -102,9 +102,9 @@ struct fmt_unveil<T*, void>
 template <typename T, std::size_t N>
 struct fmt_unveil<T[N], void>
 {
-	using type = const T*;
+	using type = std::add_const_t<T>*;
 
-	static inline u64 get(const T* arg)
+	static inline u64 get(type arg)
 	{
 		return reinterpret_cast<std::uintptr_t>(arg);
 	}
@@ -250,6 +250,26 @@ using fmt_args_t = const u64(&&)[sizeof...(Args) + 1];
 
 namespace fmt
 {
+	// Base-57 format helper
+	struct base57
+	{
+		const uchar* data;
+		std::size_t size;
+
+		template <typename T>
+		base57(const T& arg)
+			: data(reinterpret_cast<const uchar*>(&arg))
+			, size(sizeof(T))
+		{
+		}
+
+		base57(const uchar* data, std::size_t size)
+			: data(data)
+			, size(size)
+		{
+		}
+	};
+
 	template <typename... Args>
 	SAFE_BUFFERS FORCE_INLINE const fmt_type_info* get_type_info()
 	{

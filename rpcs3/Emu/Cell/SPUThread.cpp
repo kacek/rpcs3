@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Utilities/JIT.h"
 #include "Utilities/lockless.h"
 #include "Utilities/sysinfo.h"
 #include "Emu/Memory/Memory.h"
@@ -22,8 +23,17 @@
 #include <cfenv>
 #include <atomic>
 #include <thread>
+#include <shared_mutex>
 
-const bool s_use_rtm = utils::has_rtm();
+const bool s_use_ssse3 =
+#ifdef _MSC_VER
+	utils::has_ssse3();
+#elif __SSSE3__
+	true;
+#else
+	false;
+#define _mm_shuffle_epi8
+#endif
 
 #ifdef _MSC_VER
 bool operator ==(const u128& lhs, const u128& rhs)
@@ -35,12 +45,11 @@ bool operator ==(const u128& lhs, const u128& rhs)
 extern u64 get_timebased_time();
 extern u64 get_system_time();
 
+extern const spu_decoder<spu_interpreter_precise> g_spu_interpreter_precise;
+
+extern const spu_decoder<spu_interpreter_fast> g_spu_interpreter_fast;
+
 extern thread_local u64 g_tls_fault_spu;
-
-const spu_decoder<spu_interpreter_precise> s_spu_interpreter_precise;
-const spu_decoder<spu_interpreter_fast> s_spu_interpreter_fast;
-
-std::atomic<u64> g_num_spu_threads = { 0ull };
 
 template <>
 void fmt_class_string<spu_decoder_type>::format(std::string& out, u64 arg)
@@ -53,6 +62,22 @@ void fmt_class_string<spu_decoder_type>::format(std::string& out, u64 arg)
 		case spu_decoder_type::fast: return "Interpreter (fast)";
 		case spu_decoder_type::asmjit: return "Recompiler (ASMJIT)";
 		case spu_decoder_type::llvm: return "Recompiler (LLVM)";
+		}
+
+		return unknown;
+	});
+}
+
+template <>
+void fmt_class_string<spu_block_size_type>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](spu_block_size_type type)
+	{
+		switch (type)
+		{
+		case spu_block_size_type::safe: return "Safe";
+		case spu_block_size_type::mega: return "Mega";
+		case spu_block_size_type::giga: return "Giga";
 		}
 
 		return unknown;
@@ -75,8 +100,8 @@ namespace spu
 			{
 				if (timeout_ms > 0)
 				{
-					const auto timeout = timeout_ms * 1000u; //convert to microseconds
-					const auto start = get_system_time();
+					const u64 timeout = timeout_ms * 1000u; //convert to microseconds
+					const u64 start = get_system_time();
 					auto remaining = timeout;
 
 					while (atomic_instruction_table[pc_offset].load(std::memory_order_consume) >= max_concurrent_instructions)
@@ -96,7 +121,8 @@ namespace spu
 				else
 				{
 					//Slight pause if function is overburdened
-					thread_ctrl::wait_for(100);
+					const auto count = atomic_instruction_table[pc_offset].load(std::memory_order_consume) * 100ull;
+					busy_wait(count);
 				}
 			}
 
@@ -134,6 +160,179 @@ namespace spu
 	}
 }
 
+const auto spu_putllc_tx = build_function_asm<bool(*)(u32 raddr, u64 rtime, const void* _old, const void* _new)>([](asmjit::X86Assembler& c, auto& args)
+{
+	using namespace asmjit;
+
+	Label fall = c.newLabel();
+	Label fail = c.newLabel();
+
+	// Prepare registers
+	c.mov(x86::rax, imm_ptr(&vm::g_reservations));
+	c.mov(x86::r10, x86::qword_ptr(x86::rax));
+	c.mov(x86::rax, imm_ptr(&vm::g_base_addr));
+	c.mov(x86::r11, x86::qword_ptr(x86::rax));
+	c.lea(x86::r11, x86::qword_ptr(x86::r11, args[0]));
+	c.shr(args[0], 4);
+	c.lea(x86::r10, x86::qword_ptr(x86::r10, args[0]));
+	c.mov(args[0].r32(), 3);
+
+	// Prepare data (Windows has only 6 volatile vector registers)
+	c.vmovups(x86::ymm0, x86::yword_ptr(args[2], 0));
+	c.vmovups(x86::ymm1, x86::yword_ptr(args[2], 32));
+	c.vmovups(x86::ymm2, x86::yword_ptr(args[2], 64));
+	c.vmovups(x86::ymm3, x86::yword_ptr(args[2], 96));
+#ifdef _WIN32
+	c.vmovups(x86::ymm4, x86::yword_ptr(args[3], 0));
+	c.vmovups(x86::ymm5, x86::yword_ptr(args[3], 96));
+#else
+	c.vmovups(x86::ymm6, x86::yword_ptr(args[3], 0));
+	c.vmovups(x86::ymm7, x86::yword_ptr(args[3], 32));
+	c.vmovups(x86::ymm8, x86::yword_ptr(args[3], 64));
+	c.vmovups(x86::ymm9, x86::yword_ptr(args[3], 96));
+#endif
+
+	// Begin transaction
+	Label begin = build_transaction_enter(c, fall);
+	c.cmp(x86::qword_ptr(x86::r10), args[1]);
+	c.jne(fail);
+	c.vxorps(x86::ymm0, x86::ymm0, x86::yword_ptr(x86::r11, 0));
+	c.vxorps(x86::ymm1, x86::ymm1, x86::yword_ptr(x86::r11, 32));
+	c.vxorps(x86::ymm2, x86::ymm2, x86::yword_ptr(x86::r11, 64));
+	c.vxorps(x86::ymm3, x86::ymm3, x86::yword_ptr(x86::r11, 96));
+	c.vorps(x86::ymm0, x86::ymm0, x86::ymm1);
+	c.vorps(x86::ymm1, x86::ymm2, x86::ymm3);
+	c.vorps(x86::ymm0, x86::ymm1, x86::ymm0);
+	c.vptest(x86::ymm0, x86::ymm0);
+	c.jnz(fail);
+#ifdef _WIN32
+	c.vmovups(x86::ymm2, x86::yword_ptr(args[3], 32));
+	c.vmovups(x86::ymm3, x86::yword_ptr(args[3], 64));
+	c.vmovaps(x86::yword_ptr(x86::r11, 0), x86::ymm4);
+	c.vmovaps(x86::yword_ptr(x86::r11, 32), x86::ymm2);
+	c.vmovaps(x86::yword_ptr(x86::r11, 64), x86::ymm3);
+	c.vmovaps(x86::yword_ptr(x86::r11, 96), x86::ymm5);
+#else
+	c.vmovaps(x86::yword_ptr(x86::r11, 0), x86::ymm6);
+	c.vmovaps(x86::yword_ptr(x86::r11, 32), x86::ymm7);
+	c.vmovaps(x86::yword_ptr(x86::r11, 64), x86::ymm8);
+	c.vmovaps(x86::yword_ptr(x86::r11, 96), x86::ymm9);
+#endif
+	c.add(x86::qword_ptr(x86::r10), 1);
+	c.xend();
+	c.vzeroupper();
+	c.mov(x86::eax, 1);
+	c.ret();
+
+	// Touch memory after transaction failure
+	c.bind(fall);
+	c.sub(args[0].r32(), 1);
+	c.jz(fail);
+	c.sar(x86::eax, 24);
+	c.js(fail);
+	c.lock().add(x86::qword_ptr(x86::r11), 0);
+	c.lock().add(x86::qword_ptr(x86::r10), 0);
+#ifdef _WIN32
+	c.vmovups(x86::ymm4, x86::yword_ptr(args[3], 0));
+	c.vmovups(x86::ymm5, x86::yword_ptr(args[3], 96));
+#endif
+	c.jmp(begin);
+
+	c.bind(fail);
+	build_transaction_abort(c, 0xff);
+	c.xor_(x86::eax, x86::eax);
+	c.ret();
+});
+
+const auto spu_getll_tx = build_function_asm<bool(*)(u32 raddr, void* rdata, u64* out_rtime)>([](asmjit::X86Assembler& c, auto& args)
+{
+	using namespace asmjit;
+
+	Label fall = c.newLabel();
+
+	// Prepare registers
+	c.mov(x86::rax, imm_ptr(&vm::g_reservations));
+	c.mov(x86::r10, x86::qword_ptr(x86::rax));
+	c.mov(x86::rax, imm_ptr(&vm::g_base_addr));
+	c.mov(x86::r11, x86::qword_ptr(x86::rax));
+	c.lea(x86::r11, x86::qword_ptr(x86::r11, args[0]));
+	c.shr(args[0], 4);
+	c.lea(x86::r10, x86::qword_ptr(x86::r10, args[0]));
+	c.mov(args[0].r32(), 2);
+
+	// Begin transaction
+	Label begin = build_transaction_enter(c, fall);
+	c.mov(x86::rax, x86::qword_ptr(x86::r10));
+	c.vmovaps(x86::ymm0, x86::yword_ptr(x86::r11, 0));
+	c.vmovaps(x86::ymm1, x86::yword_ptr(x86::r11, 32));
+	c.vmovaps(x86::ymm2, x86::yword_ptr(x86::r11, 64));
+	c.vmovaps(x86::ymm3, x86::yword_ptr(x86::r11, 96));
+	c.xend();
+	c.vmovups(x86::yword_ptr(args[1], 0), x86::ymm0);
+	c.vmovups(x86::yword_ptr(args[1], 32), x86::ymm1);
+	c.vmovups(x86::yword_ptr(args[1], 64), x86::ymm2);
+	c.vmovups(x86::yword_ptr(args[1], 96), x86::ymm3);
+	c.vzeroupper();
+	c.mov(x86::qword_ptr(args[2]), x86::rax);
+	c.mov(x86::eax, 1);
+	c.ret();
+
+	// Touch memory after transaction failure
+	c.bind(fall);
+	c.pause();
+	c.mov(x86::rax, x86::qword_ptr(x86::r11));
+	c.mov(x86::rax, x86::qword_ptr(x86::r10));
+	c.sub(args[0], 1);
+	c.jnz(begin);
+	c.xor_(x86::eax, x86::eax);
+	c.ret();
+});
+
+const auto spu_putlluc_tx = build_function_asm<bool(*)(u32 raddr, const void* rdata)>([](asmjit::X86Assembler& c, auto& args)
+{
+	using namespace asmjit;
+
+	Label fall = c.newLabel();
+
+	// Prepare registers
+	c.mov(x86::rax, imm_ptr(&vm::g_reservations));
+	c.mov(x86::r10, x86::qword_ptr(x86::rax));
+	c.mov(x86::rax, imm_ptr(&vm::g_base_addr));
+	c.mov(x86::r11, x86::qword_ptr(x86::rax));
+	c.lea(x86::r11, x86::qword_ptr(x86::r11, args[0]));
+	c.shr(args[0], 4);
+	c.lea(x86::r10, x86::qword_ptr(x86::r10, args[0]));
+	c.mov(args[0].r32(), 2);
+
+	// Prepare data
+	c.vmovups(x86::ymm0, x86::yword_ptr(args[1], 0));
+	c.vmovups(x86::ymm1, x86::yword_ptr(args[1], 32));
+	c.vmovups(x86::ymm2, x86::yword_ptr(args[1], 64));
+	c.vmovups(x86::ymm3, x86::yword_ptr(args[1], 96));
+
+	// Begin transaction
+	Label begin = build_transaction_enter(c, fall);
+	c.vmovaps(x86::yword_ptr(x86::r11, 0), x86::ymm0);
+	c.vmovaps(x86::yword_ptr(x86::r11, 32), x86::ymm1);
+	c.vmovaps(x86::yword_ptr(x86::r11, 64), x86::ymm2);
+	c.vmovaps(x86::yword_ptr(x86::r11, 96), x86::ymm3);
+	c.add(x86::qword_ptr(x86::r10), 1);
+	c.xend();
+	c.vzeroupper();
+	c.mov(x86::eax, 1);
+	c.ret();
+
+	// Touch memory after transaction failure
+	c.bind(fall);
+	c.pause();
+	c.lock().add(x86::qword_ptr(x86::r11), 0);
+	c.lock().add(x86::qword_ptr(x86::r10), 0);
+	c.sub(args[0], 1);
+	c.jnz(begin);
+	c.xor_(x86::eax, x86::eax);
+	c.ret();
+});
+
 void spu_int_ctrl_t::set(u64 ints)
 {
 	// leave only enabled interrupts
@@ -160,36 +359,12 @@ spu_imm_table_t::scale_table_t::scale_table_t()
 {
 	for (s32 i = -155; i < 174; i++)
 	{
-		m_data[i + 155] = _mm_set1_ps(static_cast<float>(std::exp2(i)));
+		m_data[i + 155].vf = _mm_set1_ps(static_cast<float>(std::exp2(i)));
 	}
 }
 
 spu_imm_table_t::spu_imm_table_t()
 {
-	for (u32 i = 0; i < sizeof(fsm) / sizeof(fsm[0]); i++)
-	{
-		for (u32 j = 0; j < 4; j++)
-		{
-			fsm[i]._u32[j] = (i & (1 << j)) ? 0xffffffff : 0;
-		}
-	}
-
-	for (u32 i = 0; i < sizeof(fsmh) / sizeof(fsmh[0]); i++)
-	{
-		for (u32 j = 0; j < 8; j++)
-		{
-			fsmh[i]._u16[j] = (i & (1 << j)) ? 0xffff : 0;
-		}
-	}
-
-	for (u32 i = 0; i < sizeof(fsmb) / sizeof(fsmb[0]); i++)
-	{
-		for (u32 j = 0; j < 16; j++)
-		{
-			fsmb[i]._u8[j] = (i & (1 << j)) ? 0xff : 0;
-		}
-	}
-
 	for (u32 i = 0; i < sizeof(sldq_pshufb) / sizeof(sldq_pshufb[0]); i++)
 	{
 		for (u32 j = 0; j < 16; j++)
@@ -200,9 +375,11 @@ spu_imm_table_t::spu_imm_table_t()
 
 	for (u32 i = 0; i < sizeof(srdq_pshufb) / sizeof(srdq_pshufb[0]); i++)
 	{
+		const u32 im = (0u - i) & 0x1f;
+
 		for (u32 j = 0; j < 16; j++)
 		{
-			srdq_pshufb[i]._u8[j] = (j + i > 15) ? 0xff : static_cast<u8>(j + i);
+			srdq_pshufb[i]._u8[j] = (j + im > 15) ? 0xff : static_cast<u8>(j + im);
 		}
 	}
 
@@ -217,25 +394,15 @@ spu_imm_table_t::spu_imm_table_t()
 
 void SPUThread::on_spawn()
 {
-	if (g_cfg.core.bind_spu_cores)
+	if (g_cfg.core.thread_scheduler_enabled)
 	{
-		//Get next secondary core number
-		auto core_count = std::thread::hardware_concurrency();
-		if (core_count > 0 && core_count <= 16)
-		{
-			auto half_count = core_count / 2;
-			auto assigned_secondary_core = ((g_num_spu_threads % half_count) * 2) + 1;
-
-			thread_ctrl::set_ideal_processor_core((s32)assigned_secondary_core);
-		}
+		thread_ctrl::set_thread_affinity_mask(thread_ctrl::get_affinity_mask(thread_class::spu));
 	}
 
 	if (g_cfg.core.lower_spu_priority)
 	{
 		thread_ctrl::set_native_priority(-1);
 	}
-
-	g_num_spu_threads++;
 }
 
 void SPUThread::on_init(const std::shared_ptr<void>& _this)
@@ -255,11 +422,32 @@ std::string SPUThread::get_name() const
 
 std::string SPUThread::dump() const
 {
-	std::string&& ret = cpu_thread::dump();
-	ret += fmt::format("\n" "Tag mask: 0x%08x\n" "MFC entries: %u\n", +ch_tag_mask, mfc_queue.size());
-	ret += "Registers:\n=========\n";
+	std::string ret = cpu_thread::dump();
 
-	for (uint i = 0; i<128; ++i) ret += fmt::format("GPR[%d] = %s\n", i, gpr[i]);
+	fmt::append(ret, "\nBlock Weight: %u (Retreats: %u)", block_counter, block_failure);
+	fmt::append(ret, "\n[%s]", ch_mfc_cmd);
+	fmt::append(ret, "\nTag Mask: 0x%08x", ch_tag_mask);
+	fmt::append(ret, "\nMFC Stall: 0x%08x", ch_stall_mask);
+	fmt::append(ret, "\nMFC Queue Size: %u", mfc_size);
+
+	for (u32 i = 0; i < 16; i++)
+	{
+		if (i < mfc_size)
+		{
+			fmt::append(ret, "\n%s", mfc_queue[i]);
+		}
+		else
+		{
+			fmt::append(ret, "\n[-]");
+		}
+	}
+
+	ret += "\nRegisters:\n=========";
+
+	for (u32 i = 0; i < 128; i++)
+	{
+		fmt::append(ret, "\nGPR[%d] = %s", i, gpr[i]);
+	}
 
 	return ret;
 }
@@ -272,8 +460,12 @@ void SPUThread::cpu_init()
 	ch_mfc_cmd = {};
 
 	srr0 = 0;
+	mfc_size = 0;
+	mfc_barrier = 0;
+	mfc_fence = 0;
 	ch_tag_upd = 0;
 	ch_tag_mask = 0;
+	mfc_prxy_mask = 0;
 	ch_tag_stat.data.store({});
 	ch_stall_mask = 0;
 	ch_stall_stat.data.store({});
@@ -291,6 +483,7 @@ void SPUThread::cpu_init()
 
 	ch_event_mask = 0;
 	ch_event_stat = 0;
+	interrupts_enabled = false;
 	raddr = 0;
 
 	ch_dec_start_timestamp = get_timebased_time(); // ???
@@ -312,11 +505,11 @@ extern thread_local std::string(*g_tls_log_prefix)();
 void SPUThread::cpu_task()
 {
 	std::fesetround(FE_TOWARDZERO);
-	
-	if (g_cfg.core.spu_decoder == spu_decoder_type::asmjit)
+
+	if (g_cfg.core.set_daz_and_ftz && g_cfg.core.spu_decoder != spu_decoder_type::precise)
 	{
-		if (!spu_db) spu_db = fxm::get_always<SPUDatabase>();
-		return spu_recompiler_base::enter(*this);
+		// Set DAZ and FTZ
+		_mm_setcsr(_mm_getcsr() | 0x8840);
 	}
 
 	g_tls_log_prefix = []
@@ -326,47 +519,110 @@ void SPUThread::cpu_task()
 		return fmt::format("%s [0x%05x]", cpu->get_name(), cpu->pc);
 	};
 
+	if (jit)
+	{
+		while (LIKELY(!test(state) || !check_state()))
+		{
+			jit_dispatcher[pc / 4](*this, vm::_ptr<u8>(offset), nullptr);
+		}
+
+		// Print some stats
+		LOG_NOTICE(SPU, "Stats: Block Weight: %u (Retreats: %u);", block_counter, block_failure);
+		return;
+	}
+
 	// Select opcode table
 	const auto& table = *(
-		g_cfg.core.spu_decoder == spu_decoder_type::precise ? &s_spu_interpreter_precise.get_table() :
-		g_cfg.core.spu_decoder == spu_decoder_type::fast ? &s_spu_interpreter_fast.get_table() :
+		g_cfg.core.spu_decoder == spu_decoder_type::precise ? &g_spu_interpreter_precise.get_table() :
+		g_cfg.core.spu_decoder == spu_decoder_type::fast ? &g_spu_interpreter_fast.get_table() :
 		(fmt::throw_exception<std::logic_error>("Invalid SPU decoder"), nullptr));
 
-	// LS base address
-	const auto base = vm::ps3::_ptr<const u32>(offset);
+	// LS pointer
+	const auto base = vm::_ptr<const u8>(offset);
+	const auto bswap4 = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+
+	v128 _op;
+	using func_t = decltype(&spu_interpreter::UNK);
+	func_t func0, func1, func2, func3, func4, func5;
 
 	while (true)
 	{
-		if (!test(state))
+		if (UNLIKELY(test(state)))
 		{
-			// Read opcode
-			const u32 op = base[pc / 4];
+			if (check_state()) return;
 
-			// Call interpreter function
-			table[spu_decode(op)](*this, { op });
-
-			// Next instruction
-			pc += 4;
+			// Decode single instruction (may be step)
+			const u32 op = *reinterpret_cast<const be_t<u32>*>(base + pc);
+			if (table[spu_decode(op)](*this, {op})) { pc += 4; }
 			continue;
 		}
 
-		if (check_state()) return;
+		if (pc % 16 || !s_use_ssse3)
+		{
+			// Unaligned
+			const u32 op = *reinterpret_cast<const be_t<u32>*>(base + pc);
+			if (table[spu_decode(op)](*this, {op})) { pc += 4; }
+			continue;
+		}
+
+		// Reinitialize
+		_op.vi =  _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(base + pc)), bswap4);
+		func0 = table[spu_decode(_op._u32[0])];
+		func1 = table[spu_decode(_op._u32[1])];
+		func2 = table[spu_decode(_op._u32[2])];
+		func3 = table[spu_decode(_op._u32[3])];
+
+		while (LIKELY(func0(*this, {_op._u32[0]})))
+		{
+			pc += 4;
+			if (LIKELY(func1(*this, {_op._u32[1]})))
+			{
+				pc += 4;
+				u32 op2 = _op._u32[2];
+				u32 op3 = _op._u32[3];
+				_op.vi =  _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(base + pc + 8)), bswap4);
+				func0 = table[spu_decode(_op._u32[0])];
+				func1 = table[spu_decode(_op._u32[1])];
+				func4 = table[spu_decode(_op._u32[2])];
+				func5 = table[spu_decode(_op._u32[3])];
+				if (LIKELY(func2(*this, {op2})))
+				{
+					pc += 4;
+					if (LIKELY(func3(*this, {op3})))
+					{
+						pc += 4;
+						func2 = func4;
+						func3 = func5;
+
+						if (UNLIKELY(test(state)))
+						{
+							break;
+						}
+						continue;
+					}
+					break;
+				}
+				break;
+			}
+			break;
+		}
 	}
+}
+
+void SPUThread::cpu_mem()
+{
+	//vm::passive_lock(*this);
+}
+
+void SPUThread::cpu_unmem()
+{
+	//state.test_and_set(cpu_flag::memory);
 }
 
 SPUThread::~SPUThread()
 {
 	// Deallocate Local Storage
 	vm::dealloc_verbose_nothrow(offset);
-}
-
-SPUThread::SPUThread(const std::string& name)
-	: cpu_thread(idm::last_id())
-	, m_name(name)
-	, index(0)
-	, offset(0)
-	, group(nullptr)
-{
 }
 
 SPUThread::SPUThread(const std::string& name, u32 index, lv2_spu_group* group)
@@ -376,6 +632,27 @@ SPUThread::SPUThread(const std::string& name, u32 index, lv2_spu_group* group)
 	, offset(0)
 	, group(group)
 {
+	if (g_cfg.core.spu_decoder == spu_decoder_type::asmjit)
+	{
+		jit = spu_recompiler_base::make_asmjit_recompiler();
+	}
+
+	if (g_cfg.core.spu_decoder == spu_decoder_type::llvm)
+	{
+		jit = spu_recompiler_base::make_llvm_recompiler();
+	}
+
+	if (g_cfg.core.spu_decoder != spu_decoder_type::fast && g_cfg.core.spu_decoder != spu_decoder_type::precise)
+	{
+		// Initialize lookup table
+		jit_dispatcher.fill(&spu_recompiler_base::dispatch);
+
+		if (g_cfg.core.spu_block_size != spu_block_size_type::safe)
+		{
+			// Initialize stack mirror
+			std::memset(stack_mirror.data(), 0xff, sizeof(stack_mirror));
+		}
+	}
 }
 
 void SPUThread::push_snr(u32 number, u32 value)
@@ -394,19 +671,52 @@ void SPUThread::push_snr(u32 number, u32 value)
 	}
 }
 
-void SPUThread::do_dma_transfer(const spu_mfc_cmd& args, bool from_mfc)
+void SPUThread::do_dma_transfer(const spu_mfc_cmd& args)
 {
-	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK)) == MFC_GET_CMD;
+	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
 
 	u32 eal = args.eal;
 	u32 lsa = args.lsa & 0x3ffff;
 
-	if (eal >= SYS_SPU_THREAD_BASE_LOW && offset < RAW_SPU_BASE_ADDR) // SPU Thread Group MMIO (LS and SNR)
+	// SPU Thread Group MMIO (LS and SNR) and RawSPU MMIO
+	if (eal >= RAW_SPU_BASE_ADDR)
 	{
 		const u32 index = (eal - SYS_SPU_THREAD_BASE_LOW) / SYS_SPU_THREAD_OFFSET; // thread number in group
 		const u32 offset = (eal - SYS_SPU_THREAD_BASE_LOW) % SYS_SPU_THREAD_OFFSET; // LS offset or MMIO register
 
-		if (group && index < group->num && group->threads[index])
+		if (eal < SYS_SPU_THREAD_BASE_LOW)
+		{
+			// RawSPU MMIO
+			auto thread = idm::get<RawSPUThread>((eal - RAW_SPU_BASE_ADDR) / RAW_SPU_OFFSET);
+
+			if (!thread)
+			{
+				fmt::throw_exception("RawSPU not found (cmd=0x%x, lsa=0x%x, ea=0x%llx, tag=0x%x, size=0x%x)" HERE, args.cmd, args.lsa, args.eal, args.tag, args.size);
+			}
+
+			u32 value;
+			if ((eal - RAW_SPU_BASE_ADDR) % RAW_SPU_OFFSET + args.size - 1 < 0x40000) // LS access
+			{
+			}
+			else if (args.size == 4 && is_get && thread->read_reg(eal, value))
+			{
+				_ref<u32>(lsa) = value;
+				return;
+			}
+			else if (args.size == 4 && !is_get && thread->write_reg(eal, _ref<u32>(lsa)))
+			{
+				return;
+			}
+			else
+			{
+				fmt::throw_exception("Invalid RawSPU MMIO offset (cmd=0x%x, lsa=0x%x, ea=0x%llx, tag=0x%x, size=0x%x)" HERE, args.cmd, args.lsa, args.eal, args.tag, args.size);
+			}
+		}
+		else if (this->offset >= RAW_SPU_BASE_ADDR)
+		{
+			fmt::throw_exception("SPU MMIO used for RawSPU (cmd=0x%x, lsa=0x%x, ea=0x%llx, tag=0x%x, size=0x%x)" HERE, args.cmd, args.lsa, args.eal, args.tag, args.size);
+		}
+		else if (group && index < group->num && group->threads[index])
 		{
 			auto& spu = static_cast<SPUThread&>(*group->threads[index]);
 
@@ -430,10 +740,81 @@ void SPUThread::do_dma_transfer(const spu_mfc_cmd& args, bool from_mfc)
 		}
 	}
 
-	if (args.cmd & (MFC_BARRIER_MASK | MFC_FENCE_MASK)) _mm_mfence();
-
 	void* dst = vm::base(eal);
 	void* src = vm::base(offset + lsa);
+
+	if (UNLIKELY(!is_get && !g_use_rtm))
+	{
+		switch (u32 size = args.size)
+		{
+		case 1:
+		{
+			auto& res = vm::reservation_lock(eal, 1);
+			*static_cast<u8*>(dst) = *static_cast<const u8*>(src);
+			res &= ~1ull;
+			break;
+		}
+		case 2:
+		{
+			auto& res = vm::reservation_lock(eal, 2);
+			*static_cast<u16*>(dst) = *static_cast<const u16*>(src);
+			res &= ~1ull;
+			break;
+		}
+		case 4:
+		{
+			auto& res = vm::reservation_lock(eal, 4);
+			*static_cast<u32*>(dst) = *static_cast<const u32*>(src);
+			res &= ~1ull;
+			break;
+		}
+		case 8:
+		{
+			auto& res = vm::reservation_lock(eal, 8);
+			*static_cast<u64*>(dst) = *static_cast<const u64*>(src);
+			res &= ~1ull;
+			break;
+		}
+		case 16:
+		{
+			auto& res = vm::reservation_lock(eal, 16);
+			_mm_store_si128(static_cast<__m128i*>(dst), _mm_load_si128(static_cast<const __m128i*>(src)));
+			res &= ~1ull;
+			break;
+		}
+		default:
+		{
+			auto* res = &vm::reservation_lock(eal, 16);
+			auto vdst = static_cast<__m128i*>(dst);
+			auto vsrc = static_cast<const __m128i*>(src);
+
+			for (u32 addr = eal, end = eal + size;; vdst++, vsrc++)
+			{
+				_mm_store_si128(vdst, _mm_load_si128(vsrc));
+
+				addr += 16;
+
+				if (addr == end)
+				{
+					break;
+				}
+
+				if (addr % 128)
+				{
+					continue;
+				}
+
+				res->fetch_and(~1ull);
+				res = &vm::reservation_lock(addr, 16);
+			}
+
+			res->fetch_and(~1ull);
+			break;
+		}
+		}
+
+		return;
+	}
 
 	if (is_get)
 	{
@@ -454,24 +835,17 @@ void SPUThread::do_dma_transfer(const spu_mfc_cmd& args, bool from_mfc)
 	}
 	case 4:
 	{
-		//if (is_get && !from_mfc)
-		{
-			*static_cast<u32*>(dst) = *static_cast<const u32*>(src);
-			break;
-		}
-
-		//_mm_stream_si32(static_cast<s32*>(dst), *static_cast<const s32*>(src));
+		*static_cast<u32*>(dst) = *static_cast<const u32*>(src);
 		break;
 	}
 	case 8:
 	{
-		//if (is_get && !from_mfc)
-		{
-			*static_cast<u64*>(dst) = *static_cast<const u64*>(src);
-			break;
-		}
-
-		//_mm_stream_si64(static_cast<s64*>(dst), *static_cast<const s64*>(src));
+		*static_cast<u64*>(dst) = *static_cast<const u64*>(src);
+		break;
+	}
+	case 16:
+	{
+		_mm_store_si128(static_cast<__m128i*>(dst), _mm_load_si128(static_cast<const __m128i*>(src)));
 		break;
 	}
 	default:
@@ -480,45 +854,6 @@ void SPUThread::do_dma_transfer(const spu_mfc_cmd& args, bool from_mfc)
 		auto vsrc = static_cast<const __m128i*>(src);
 		auto vcnt = size / sizeof(__m128i);
 
-		//if (is_get && !from_mfc)
-		{
-			while (vcnt >= 8)
-			{
-				const __m128i data[]
-				{
-					_mm_load_si128(vsrc + 0),
-					_mm_load_si128(vsrc + 1),
-					_mm_load_si128(vsrc + 2),
-					_mm_load_si128(vsrc + 3),
-					_mm_load_si128(vsrc + 4),
-					_mm_load_si128(vsrc + 5),
-					_mm_load_si128(vsrc + 6),
-					_mm_load_si128(vsrc + 7),
-				};
-
-				_mm_store_si128(vdst + 0, data[0]);
-				_mm_store_si128(vdst + 1, data[1]);
-				_mm_store_si128(vdst + 2, data[2]);
-				_mm_store_si128(vdst + 3, data[3]);
-				_mm_store_si128(vdst + 4, data[4]);
-				_mm_store_si128(vdst + 5, data[5]);
-				_mm_store_si128(vdst + 6, data[6]);
-				_mm_store_si128(vdst + 7, data[7]);
-
-				vcnt -= 8;
-				vsrc += 8;
-				vdst += 8;
-			}
-
-			while (vcnt--)
-			{
-				_mm_store_si128(vdst++, _mm_load_si128(vsrc++));
-			}
-
-			break;
-		}
-
-		// Disabled
 		while (vcnt >= 8)
 		{
 			const __m128i data[]
@@ -533,14 +868,14 @@ void SPUThread::do_dma_transfer(const spu_mfc_cmd& args, bool from_mfc)
 				_mm_load_si128(vsrc + 7),
 			};
 
-			_mm_stream_si128(vdst + 0, data[0]);
-			_mm_stream_si128(vdst + 1, data[1]);
-			_mm_stream_si128(vdst + 2, data[2]);
-			_mm_stream_si128(vdst + 3, data[3]);
-			_mm_stream_si128(vdst + 4, data[4]);
-			_mm_stream_si128(vdst + 5, data[5]);
-			_mm_stream_si128(vdst + 6, data[6]);
-			_mm_stream_si128(vdst + 7, data[7]);
+			_mm_store_si128(vdst + 0, data[0]);
+			_mm_store_si128(vdst + 1, data[1]);
+			_mm_store_si128(vdst + 2, data[2]);
+			_mm_store_si128(vdst + 3, data[3]);
+			_mm_store_si128(vdst + 4, data[4]);
+			_mm_store_si128(vdst + 5, data[5]);
+			_mm_store_si128(vdst + 6, data[6]);
+			_mm_store_si128(vdst + 7, data[7]);
 
 			vcnt -= 8;
 			vsrc += 8;
@@ -549,72 +884,314 @@ void SPUThread::do_dma_transfer(const spu_mfc_cmd& args, bool from_mfc)
 
 		while (vcnt--)
 		{
-			_mm_stream_si128(vdst++, _mm_load_si128(vsrc++));
+			_mm_store_si128(vdst++, _mm_load_si128(vsrc++));
 		}
+		break;
 	}
-	}
-
-	if (is_get && from_mfc)
-	{
-		//_mm_sfence();
 	}
 }
 
-void SPUThread::process_mfc_cmd()
+bool SPUThread::do_dma_check(const spu_mfc_cmd& args)
 {
-	spu::scheduler::concurrent_execution_watchdog watchdog(*this);
-	LOG_TRACE(SPU, "DMAC: cmd=%s, lsa=0x%x, ea=0x%llx, tag=0x%x, size=0x%x", ch_mfc_cmd.cmd, ch_mfc_cmd.lsa, ch_mfc_cmd.eal, ch_mfc_cmd.tag, ch_mfc_cmd.size);
+	const u32 mask = 1u << args.tag;
 
-	const auto mfc = fxm::check_unlocked<mfc_thread>();
-	const u32 max_imm_dma_size = g_cfg.core.max_spu_immediate_write_size;
-
-	// Check queue size
-	auto check_queue_size = [&]()
+	if (UNLIKELY(mfc_barrier & mask || (args.cmd & (MFC_BARRIER_MASK | MFC_FENCE_MASK) && mfc_fence & mask)))
 	{
-		while (mfc_queue.size() >= 16)
+		// Check for special value combination (normally impossible)
+		if (false)
 		{
-			if (test(state, cpu_flag::stop + cpu_flag::dbg_global_stop))
+			// Update barrier/fence masks if necessary
+			mfc_barrier = 0;
+			mfc_fence = 0;
+
+			for (u32 i = 0; i < mfc_size; i++)
 			{
-				return;
+				if ((mfc_queue[i].cmd & ~0xc) == MFC_BARRIER_CMD)
+				{
+					mfc_barrier |= -1;
+					continue;
+				}
+
+				if (true)
+				{
+					const u32 _mask = 1u << mfc_queue[i].tag;
+
+					// A command with barrier hard blocks that tag until it's been dealt with
+					if (mfc_queue[i].cmd & MFC_BARRIER_MASK)
+					{
+						mfc_barrier |= _mask;
+					}
+
+					// A new command that has a fence can't be executed until the stalled list has been dealt with
+					mfc_fence |= _mask;
+				}
 			}
 
-			// TODO: investigate lost notifications
-			std::this_thread::yield();
-			_mm_lfence();
-		}
-	};
+			if (mfc_barrier & mask || (args.cmd & MFC_FENCE_MASK && mfc_fence & mask))
+			{
+				return false;
+			}
 
-	switch (ch_mfc_cmd.cmd)
+			return true;
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+bool SPUThread::do_list_transfer(spu_mfc_cmd& args)
+{
+	struct list_element
+	{
+		be_t<u16> sb; // Stall-and-Notify bit (0x8000)
+		be_t<u16> ts; // List Transfer Size
+		be_t<u32> ea; // External Address Low
+	} item{};
+
+	while (args.size)
+	{
+		if (UNLIKELY(item.sb & 0x8000))
+		{
+			ch_stall_mask |= (1u << args.tag);
+
+			if (!ch_stall_stat.get_count())
+			{
+				ch_event_stat |= SPU_EVENT_SN;
+			}
+
+			ch_stall_stat.set_value((1u << args.tag) | ch_stall_stat.get_value());
+			return false;
+		}
+
+		args.lsa &= 0x3fff0;
+		item = _ref<list_element>(args.eal & 0x3fff8);
+
+		const u32 size = item.ts & 0x7fff;
+		const u32 addr = item.ea;
+
+		LOG_TRACE(SPU, "LIST: addr=0x%x, size=0x%x, lsa=0x%05x, sb=0x%x", addr, size, args.lsa | (addr & 0xf), item.sb);
+
+		if (size)
+		{
+			spu_mfc_cmd transfer;
+			transfer.eal  = addr;
+			transfer.eah  = 0;
+			transfer.lsa  = args.lsa | (addr & 0xf);
+			transfer.tag  = args.tag;
+			transfer.cmd  = MFC(args.cmd & ~MFC_LIST_MASK);
+			transfer.size = size;
+
+			do_dma_transfer(transfer);
+			const u32 add_size = std::max<u32>(size, 16);
+			args.lsa += add_size;
+		}
+
+		args.eal += 8;
+		args.size -= 8;
+	}
+
+	return true;
+}
+
+void SPUThread::do_putlluc(const spu_mfc_cmd& args)
+{
+	const u32 addr = args.eal & -128u;
+
+	if (raddr && addr == raddr)
+	{
+		ch_event_stat |= SPU_EVENT_LR;
+		raddr = 0;
+	}
+
+	auto& data = vm::_ref<decltype(rdata)>(addr);
+	const auto to_write = _ref<decltype(rdata)>(args.lsa & 0x3ff80);
+
+	// Store unconditionally
+	if (LIKELY(g_use_rtm))
+	{
+		u64 count = 1;
+
+		while (!spu_putlluc_tx(addr, to_write.data()))
+		{
+			std::this_thread::yield();
+			count += 2;
+		}
+
+		if (count > 5)
+		{
+			LOG_ERROR(SPU, "%s took too long: %u", args.cmd, count);
+		}
+	}
+	else
+	{
+		auto& res = vm::reservation_lock(addr, 128);
+
+		vm::_ref<atomic_t<u32>>(addr) += 0;
+
+		if (g_cfg.core.spu_accurate_putlluc)
+		{
+			// Full lock (heavyweight)
+			// TODO: vm::check_addr
+			vm::writer_lock lock(1);
+			data = to_write;
+			vm::reservation_update(addr, 128);
+		}
+		else
+		{
+			data = to_write;
+			vm::reservation_update(addr, 128);
+		}
+	}
+
+	vm::reservation_notifier(addr, 128).notify_all();
+}
+
+void SPUThread::do_mfc(bool wait)
+{
+	u32 removed = 0;
+	u32 barrier = 0;
+	u32 fence = 0;
+
+	// Process enqueued commands
+	std::remove_if(mfc_queue + 0, mfc_queue + mfc_size, [&](spu_mfc_cmd& args)
+	{
+		if ((args.cmd & ~0xc) == MFC_BARRIER_CMD)
+		{
+			if (&args - mfc_queue <= removed)
+			{
+				// Remove barrier-class command if it's the first in the queue
+				_mm_mfence();
+				removed++;
+				return true;
+			}
+
+			// Block all tags
+			barrier |= -1;
+			return false;
+		}
+
+		// Select tag bit in the tag mask or the stall mask
+		const u32 mask = 1u << args.tag;
+
+		if (barrier & mask)
+		{
+			fence |= mask;
+			return false;
+		}
+
+		if (args.cmd & (MFC_BARRIER_MASK | MFC_FENCE_MASK) && fence & mask)
+		{
+			if (args.cmd & MFC_BARRIER_MASK)
+			{
+				barrier |= mask;
+			}
+
+			return false;
+		}
+
+		if (args.cmd & MFC_LIST_MASK)
+		{
+			if (!test(ch_stall_mask, mask))
+			{
+				if (do_list_transfer(args))
+				{
+					removed++;
+					return true;
+				}
+			}
+
+			if (args.cmd & MFC_BARRIER_MASK)
+			{
+				barrier |= mask;
+			}
+
+			fence |= mask;
+			return false;
+		}
+
+		if (args.size)
+		{
+			do_dma_transfer(args);
+		}
+		else if (args.cmd == MFC_PUTQLLUC_CMD)
+		{
+			if (fence & mask)
+			{
+				return false;
+			}
+
+			do_putlluc(args);
+		}
+
+		removed++;
+		return true;
+	});
+
+	mfc_size -= removed;
+	mfc_barrier = barrier;
+	mfc_fence = fence;
+
+	if (removed && ch_tag_upd)
+	{
+		const u32 completed = get_mfc_completed();
+
+		if (completed && ch_tag_upd == 1)
+		{
+			ch_tag_stat.set_value(completed);
+			ch_tag_upd = 0;
+		}
+		else if (completed == ch_tag_mask && ch_tag_upd == 2)
+		{
+			ch_tag_stat.set_value(completed);
+			ch_tag_upd = 0;
+		}
+	}
+}
+
+u32 SPUThread::get_mfc_completed()
+{
+	return ch_tag_mask & ~mfc_fence;
+}
+
+bool SPUThread::process_mfc_cmd(spu_mfc_cmd args)
+{
+	// Stall infinitely if MFC queue is full
+	while (UNLIKELY(mfc_size >= 16))
+	{
+		if (test(state, cpu_flag::stop))
+		{
+			return false;
+		}
+
+		thread_ctrl::wait();
+	}
+
+	spu::scheduler::concurrent_execution_watchdog watchdog(*this);
+	LOG_TRACE(SPU, "DMAC: cmd=%s, lsa=0x%x, ea=0x%llx, tag=0x%x, size=0x%x", args.cmd, args.lsa, args.eal, args.tag, args.size);
+
+	switch (args.cmd)
 	{
 	case MFC_GETLLAR_CMD:
 	{
-		auto& data = vm::ps3::_ref<decltype(rdata)>(ch_mfc_cmd.eal);
+		const u32 addr = args.eal & -128u;
+		auto& data = vm::_ref<decltype(rdata)>(addr);
 
-		const u32 _addr = ch_mfc_cmd.eal;
-		const u64 _time = vm::reservation_acquire(raddr, 128);
-
-		if (raddr && raddr != ch_mfc_cmd.eal)
+		if (raddr && raddr != addr)
 		{
 			ch_event_stat |= SPU_EVENT_LR;
 		}
 
-		const bool is_polling = false;// raddr == _addr && rtime == _time; // TODO
+		raddr = addr;
 
-		_mm_lfence();
-		raddr = _addr;
-		rtime = _time;
+		const bool is_polling = false; // TODO
 
 		if (is_polling)
 		{
-			vm::waiter waiter;
-			waiter.owner = this;
-			waiter.addr  = raddr;
-			waiter.size  = 128;
-			waiter.stamp = rtime;
-			waiter.data  = rdata.data();
-			waiter.init();
+			rtime = vm::reservation_acquire(raddr, 128);
 
-			while (vm::reservation_acquire(raddr, 128) == waiter.stamp && rdata == data)
+			while (rdata == data && vm::reservation_acquire(raddr, 128) == rtime)
 			{
 				if (test(state, cpu_flag::stop))
 				{
@@ -624,81 +1201,107 @@ void SPUThread::process_mfc_cmd()
 				thread_ctrl::wait_for(100);
 			}
 		}
-		else if (s_use_rtm && utils::transaction_enter())
+
+		if (LIKELY(g_use_rtm))
 		{
-			if (!vm::reader_lock{vm::try_to_lock})
+			u64 count = 1;
+
+			while (g_cfg.core.spu_accurate_getllar && !spu_getll_tx(raddr, rdata.data(), &rtime))
 			{
-				_xabort(0);
+				std::this_thread::yield();
+				count += 2;
 			}
 
-			rtime = vm::reservation_acquire(raddr, 128);
-			rdata = data;
-			_xend();
+			if (!g_cfg.core.spu_accurate_getllar)
+			{
+				for (;; count++, busy_wait(300))
+				{
+					rtime = vm::reservation_acquire(raddr, 128);
+					rdata = data;
 
-			_ref<decltype(rdata)>(ch_mfc_cmd.lsa & 0x3ffff) = rdata;
-			return ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
+					if (LIKELY(vm::reservation_acquire(raddr, 128) == rtime))
+					{
+						break;
+					}
+				}
+			}
+
+			if (count > 9)
+			{
+				LOG_ERROR(SPU, "%s took too long: %u", args.cmd, count);
+			}
 		}
 		else
 		{
-			rdata = data;
-			_mm_lfence();
-		}
+			auto& res = vm::reservation_lock(raddr, 128);
 
-		// Hack: ensure no other atomic updates have happened during reading the data
-		if (is_polling || UNLIKELY(vm::reservation_acquire(raddr, 128) != rtime))
-		{
-			// TODO: vm::check_addr
-			vm::reader_lock lock;
-			rtime = vm::reservation_acquire(raddr, 128);
-			rdata = data;
+			if (g_cfg.core.spu_accurate_getllar)
+			{
+				vm::_ref<atomic_t<u32>>(raddr) += 0;
+
+				// Full lock (heavyweight)
+				// TODO: vm::check_addr
+				vm::writer_lock lock(1);
+
+				rtime = res & ~1ull;
+				rdata = data;
+				res &= ~1ull;
+			}
+			else
+			{
+				rtime = res & ~1ull;
+				rdata = data;
+				res &= ~1ull;
+			}
 		}
 
 		// Copy to LS
-		_ref<decltype(rdata)>(ch_mfc_cmd.lsa & 0x3ffff) = rdata;
-
-		return ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
+		_ref<decltype(rdata)>(args.lsa & 0x3ff80) = rdata;
+		ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
+		return true;
 	}
 
 	case MFC_PUTLLC_CMD:
 	{
 		// Store conditionally
-		auto& data = vm::ps3::_ref<decltype(rdata)>(ch_mfc_cmd.eal);
-		const auto to_write = _ref<decltype(rdata)>(ch_mfc_cmd.lsa & 0x3ffff);
+		const u32 addr = args.eal & -128u;
+		auto& data = vm::_ref<decltype(rdata)>(addr);
+		const auto to_write = _ref<decltype(rdata)>(args.lsa & 0x3ff80);
 
 		bool result = false;
 
-		if (raddr == ch_mfc_cmd.eal && rtime == vm::reservation_acquire(raddr, 128) && rdata == data)
+		if (raddr == addr && rtime == vm::reservation_acquire(raddr, 128))
 		{
-			// TODO: vm::check_addr
-			if (s_use_rtm && utils::transaction_enter())
+			if (LIKELY(g_use_rtm))
 			{
-				if (!vm::reader_lock{vm::try_to_lock})
+				if (spu_putllc_tx(raddr, rtime, rdata.data(), to_write.data()))
 				{
-					_xabort(0);
-				}
-
-				if (rtime == vm::reservation_acquire(raddr, 128) && rdata == data)
-				{
-					data = to_write;
+					vm::reservation_notifier(raddr, 128).notify_all();
 					result = true;
-
-					vm::reservation_update(raddr, 128);
-					vm::notify(raddr, 128);
 				}
 
-				_xend();
+				// Don't fallback to heavyweight lock, just give up
 			}
-			else
+			else if (rdata == data)
 			{
-				vm::writer_lock lock;
+				auto& res = vm::reservation_lock(raddr, 128);
 
-				if (rtime == vm::reservation_acquire(raddr, 128) && rdata == data)
+				vm::_ref<atomic_t<u32>>(raddr) += 0;
+
+				// Full lock (heavyweight)
+				// TODO: vm::check_addr
+				vm::writer_lock lock(1);
+
+				if (rtime == (res & ~1ull) && rdata == data)
 				{
 					data = to_write;
-					result = true;
-
 					vm::reservation_update(raddr, 128);
-					vm::notify(raddr, 128);
+					vm::reservation_notifier(raddr, 128).notify_all();
+					result = true;
+				}
+				else
+				{
+					res &= ~1ull;
 				}
 			}
 		}
@@ -718,58 +1321,36 @@ void SPUThread::process_mfc_cmd()
 		}
 
 		raddr = 0;
-		return;
+		return true;
 	}
 	case MFC_PUTLLUC_CMD:
 	{
-		if (raddr && ch_mfc_cmd.eal == raddr)
-		{
-			ch_event_stat |= SPU_EVENT_LR;
-			raddr = 0;
-		}
-
-		auto& data = vm::ps3::_ref<decltype(rdata)>(ch_mfc_cmd.eal);
-		const auto to_write = _ref<decltype(rdata)>(ch_mfc_cmd.lsa & 0x3ffff);
-
-		vm::reservation_acquire(ch_mfc_cmd.eal, 128);
-
-		// Store unconditionally
-		// TODO: vm::check_addr
-
-		if (s_use_rtm && utils::transaction_enter())
-		{
-			if (!vm::reader_lock{vm::try_to_lock})
-			{
-				_xabort(0);
-			}
-
-			data = to_write;
-			vm::reservation_update(ch_mfc_cmd.eal, 128);
-			vm::notify(ch_mfc_cmd.eal, 128);
-			_xend();
-
-			ch_atomic_stat.set_value(MFC_PUTLLUC_SUCCESS);
-			return;
-		}
-
-		vm::writer_lock lock(0);
-		data = to_write;
-		vm::reservation_update(ch_mfc_cmd.eal, 128);
-		vm::notify(ch_mfc_cmd.eal, 128);
-
+		do_putlluc(args);
 		ch_atomic_stat.set_value(MFC_PUTLLUC_SUCCESS);
-		return;
+		return true;
 	}
 	case MFC_PUTQLLUC_CMD:
 	{
-		ch_mfc_cmd.size = 128;
-		break;
+		const u32 mask = 1u << args.tag;
+
+		if (UNLIKELY((mfc_barrier | mfc_fence) & mask))
+		{
+			args.size = 0;
+			mfc_queue[mfc_size++] = args;
+			mfc_fence |= mask;
+		}
+		else
+		{
+			do_putlluc(args);
+		}
+
+		return true;
 	}
 	case MFC_SNDSIG_CMD:
 	case MFC_SNDSIGB_CMD:
 	case MFC_SNDSIGF_CMD:
 	{
-		ch_mfc_cmd.size = 4;
+		args.size = 4;
 		// Fallthrough
 	}
 	case MFC_PUT_CMD:
@@ -782,26 +1363,29 @@ void SPUThread::process_mfc_cmd()
 	case MFC_GETB_CMD:
 	case MFC_GETF_CMD:
 	{
-		// Try to process small transfers immediately
-		if (ch_mfc_cmd.size <= max_imm_dma_size && mfc_queue.size() == 0)
+		if (LIKELY(args.size <= 0x4000))
 		{
-			vm::reader_lock lock(vm::try_to_lock);
-
-			if (!lock)
+			if (LIKELY(do_dma_check(args)))
 			{
-				break;
+				if (LIKELY(args.size))
+				{
+					do_dma_transfer(args);
+				}
+
+				return true;
 			}
 
-			if (!vm::check_addr(ch_mfc_cmd.eal, ch_mfc_cmd.size, vm::page_readable | (ch_mfc_cmd.cmd & MFC_PUT_CMD ? vm::page_writable : 0)))
+			mfc_queue[mfc_size++] = args;
+			mfc_fence |= 1u << args.tag;
+
+			if (args.cmd & MFC_BARRIER_MASK)
 			{
-				// TODO
-				break;
+				mfc_barrier |= 1u << args.tag;
 			}
 
-			do_dma_transfer(ch_mfc_cmd, false);
-			return;
+			return true;
 		}
-		
+
 		break;
 	}
 	case MFC_PUTL_CMD:
@@ -814,73 +1398,25 @@ void SPUThread::process_mfc_cmd()
 	case MFC_GETLB_CMD:
 	case MFC_GETLF_CMD:
 	{
-		if (ch_mfc_cmd.size <= max_imm_dma_size && mfc_queue.size() == 0 && (ch_stall_mask & (1u << ch_mfc_cmd.tag)) == 0)
+		if (LIKELY(args.size <= 0x4000))
 		{
-			vm::reader_lock lock(vm::try_to_lock);
-
-			if (!lock)
+			if (LIKELY(do_dma_check(args) && !test(ch_stall_mask, 1u << args.tag)))
 			{
-				break;
-			}
-
-			struct list_element
-			{
-				be_t<u16> sb;
-				be_t<u16> ts;
-				be_t<u32> ea;
-			};
-			
-			u32 total_size = 0;
-
-			while (ch_mfc_cmd.size && total_size <= max_imm_dma_size)
-			{
-				ch_mfc_cmd.lsa &= 0x3fff0;
-
-				const list_element item = _ref<list_element>(ch_mfc_cmd.eal & 0x3fff8);
-
-				if (item.sb & 0x8000)
+				if (LIKELY(do_list_transfer(args)))
 				{
-					break;
+					return true;
 				}
-
-				const u32 size = item.ts;
-				const u32 addr = item.ea;
-
-				if (size)
-				{
-					if (total_size + size > max_imm_dma_size)
-					{
-						break;
-					}
-
-					if (!vm::check_addr(addr, size, vm::page_readable | (ch_mfc_cmd.cmd & MFC_PUT_CMD ? vm::page_writable : 0)))
-					{
-						// TODO
-						break;
-					}
-
-					spu_mfc_cmd transfer;
-					transfer.eal = addr;
-					transfer.eah = 0;
-					transfer.lsa = ch_mfc_cmd.lsa | (addr & 0xf);
-					transfer.tag = ch_mfc_cmd.tag;
-					transfer.cmd = MFC(ch_mfc_cmd.cmd & ~MFC_LIST_MASK);
-					transfer.size = size;
-
-					do_dma_transfer(transfer);
-					const u32 add_size = std::max<u32>(size, 16);
-					ch_mfc_cmd.lsa += add_size;
-					total_size += add_size;
-				}
-
-				ch_mfc_cmd.eal += 8;
-				ch_mfc_cmd.size -= 8;
 			}
 
-			if (ch_mfc_cmd.size == 0)
+			mfc_queue[mfc_size++] = args;
+			mfc_fence |= 1u << args.tag;
+
+			if (args.cmd & MFC_BARRIER_MASK)
 			{
-				return;
+				mfc_barrier |= 1u << args.tag;
 			}
+
+			return true;
 		}
 
 		break;
@@ -889,36 +1425,39 @@ void SPUThread::process_mfc_cmd()
 	case MFC_EIEIO_CMD:
 	case MFC_SYNC_CMD:
 	{
-		ch_mfc_cmd.size = 0;
-
-		if (mfc_queue.size() == 0)
+		if (mfc_size == 0)
 		{
 			_mm_mfence();
-			return;
+		}
+		else
+		{
+			mfc_queue[mfc_size++] = args;
+			mfc_barrier |= -1;
 		}
 
-		break;
+		return true;
 	}
 	default:
 	{
-		fmt::throw_exception("Unknown command (cmd=%s, lsa=0x%x, ea=0x%llx, tag=0x%x, size=0x%x)" HERE, ch_mfc_cmd.cmd, ch_mfc_cmd.lsa, ch_mfc_cmd.eal, ch_mfc_cmd.tag, ch_mfc_cmd.size);
+		break;
 	}
 	}
 
-	// Enqueue
-	check_queue_size();
-	verify(HERE), mfc_queue.try_push(ch_mfc_cmd);
-
-	//if (test(mfc->state, cpu_flag::is_waiting))
-	{
-		mfc->notify();
-	}
+	fmt::throw_exception("Unknown command (cmd=%s, lsa=0x%x, ea=0x%llx, tag=0x%x, size=0x%x)" HERE,
+		args.cmd, args.lsa, args.eal, args.tag, args.size);
 }
 
 u32 SPUThread::get_events(bool waiting)
 {
+	const u32 mask1 = ch_event_mask;
+
+	if (mask1 & ~SPU_EVENT_IMPLEMENTED)
+	{
+		fmt::throw_exception("SPU Events not implemented (mask=0x%x)" HERE, mask1);
+	}
+
 	// Check reservation status and set SPU_EVENT_LR if lost
-	if (raddr && (vm::reservation_acquire(raddr, sizeof(rdata)) != rtime || rdata != vm::ps3::_ref<decltype(rdata)>(raddr)))
+	if (raddr && (vm::reservation_acquire(raddr, sizeof(rdata)) != rtime || rdata != vm::_ref<decltype(rdata)>(raddr)))
 	{
 		ch_event_stat |= SPU_EVENT_LR;
 		raddr = 0;
@@ -934,9 +1473,9 @@ u32 SPUThread::get_events(bool waiting)
 	}
 
 	// Simple polling or polling with atomically set/removed SPU_EVENT_WAITING flag
-	return !waiting ? ch_event_stat & ch_event_mask : ch_event_stat.atomic_op([&](u32& stat) -> u32
+	return !waiting ? ch_event_stat & mask1 : ch_event_stat.atomic_op([&](u32& stat) -> u32
 	{
-		if (u32 res = stat & ch_event_mask)
+		if (u32 res = stat & mask1)
 		{
 			stat &= ~SPU_EVENT_WAITING;
 			return res;
@@ -949,9 +1488,9 @@ u32 SPUThread::get_events(bool waiting)
 
 void SPUThread::set_events(u32 mask)
 {
-	if (u32 unimpl = mask & ~SPU_EVENT_IMPLEMENTED)
+	if (mask & ~SPU_EVENT_IMPLEMENTED)
 	{
-		fmt::throw_exception("Unimplemented events (0x%x)" HERE, unimpl);
+		fmt::throw_exception("SPU Events not implemented (mask=0x%x)" HERE, mask);
 	}
 
 	// Set new events, get old event mask
@@ -968,17 +1507,17 @@ void SPUThread::set_interrupt_status(bool enable)
 {
 	if (enable)
 	{
-		// detect enabling interrupts with events masked
-		if (u32 mask = ch_event_mask & ~SPU_EVENT_INTR_IMPLEMENTED)
+		// Detect enabling interrupts with events masked
+		if (ch_event_mask & ~SPU_EVENT_INTR_IMPLEMENTED)
 		{
-			fmt::throw_exception("SPU Interrupts not implemented (mask=0x%x)" HERE, mask);
+			fmt::throw_exception("SPU Interrupts not implemented (mask=0x%x)" HERE, +ch_event_mask);
 		}
 
-		ch_event_stat |= SPU_EVENT_INTR_ENABLED;
+		interrupts_enabled = true;
 	}
 	else
 	{
-		ch_event_stat &= ~SPU_EVENT_INTR_ENABLED;
+		interrupts_enabled = false;
 	}
 }
 
@@ -998,54 +1537,43 @@ u32 SPUThread::get_ch_count(u32 ch)
 	case SPU_RdSigNotify2:    return ch_snr2.get_count();
 	case MFC_RdAtomicStat:    return ch_atomic_stat.get_count();
 	case SPU_RdEventStat:     return get_events() != 0;
+	case MFC_Cmd:             return 16 - mfc_size;
 	}
 
 	fmt::throw_exception("Unknown/illegal channel (ch=%d [%s])" HERE, ch, ch < 128 ? spu_ch_name[ch] : "???");
 }
 
-bool SPUThread::get_ch_value(u32 ch, u32& out)
+s64 SPUThread::get_ch_value(u32 ch)
 {
 	LOG_TRACE(SPU, "get_ch_value(ch=%d [%s])", ch, ch < 128 ? spu_ch_name[ch] : "???");
 
-	auto read_channel = [&](spu_channel_t& channel)
+	auto read_channel = [&](spu_channel& channel) -> s64
 	{
-		if (channel.try_pop(out))
-			return true;
-
 		for (int i = 0; i < 10 && channel.get_count() == 0; i++)
 		{
 			busy_wait();
 		}
 
-		u32 ctr = 0;
+		u32 out;
+
 		while (!channel.try_pop(out))
 		{
 			if (test(state, cpu_flag::stop))
 			{
-				return false;
+				return -1;
 			}
 
-			if (ctr > 10000)
-			{
-				ctr = 0;
-				std::this_thread::yield();
-			}
-			else
-			{
-				ctr++;
-				thread_ctrl::wait();
-			}
+			thread_ctrl::wait();
 		}
 
-		return true;
+		return out;
 	};
 
 	switch (ch)
 	{
 	case SPU_RdSRR0:
 	{
-		out = srr0;
-		break;
+		return srr0;
 	}
 	case SPU_RdInMbox:
 	{
@@ -1056,6 +1584,8 @@ bool SPUThread::get_ch_value(u32 ch, u32& out)
 				busy_wait();
 			}
 
+			u32 out;
+
 			if (const uint old_count = ch_in_mbox.try_pop(out))
 			{
 				if (old_count == 4 /* SPU_IN_MBOX_THRESHOLD */) // TODO: check this
@@ -1063,12 +1593,12 @@ bool SPUThread::get_ch_value(u32 ch, u32& out)
 					int_ctrl[2].set(SPU_INT2_STAT_SPU_MAILBOX_THRESHOLD_INT);
 				}
 
-				return true;
+				return out;
 			}
 
 			if (test(state & cpu_flag::stop))
 			{
-				return false;
+				return -1;
 			}
 
 			thread_ctrl::wait();
@@ -1077,13 +1607,20 @@ bool SPUThread::get_ch_value(u32 ch, u32& out)
 
 	case MFC_RdTagStat:
 	{
+		if (ch_tag_stat.get_count())
+		{
+			u32 out = ch_tag_stat.get_value();
+			ch_tag_stat.set_value(0, false);
+			return out;
+		}
+
+		// Will stall infinitely
 		return read_channel(ch_tag_stat);
 	}
 
 	case MFC_RdTagMask:
 	{
-		out = ch_tag_mask;
-		return true;
+		return ch_tag_mask;
 	}
 
 	case SPU_RdSigNotify1:
@@ -1098,29 +1635,44 @@ bool SPUThread::get_ch_value(u32 ch, u32& out)
 
 	case MFC_RdAtomicStat:
 	{
+		if (ch_atomic_stat.get_count())
+		{
+			u32 out = ch_atomic_stat.get_value();
+			ch_atomic_stat.set_value(0, false);
+			return out;
+		}
+
+		// Will stall infinitely
 		return read_channel(ch_atomic_stat);
 	}
 
 	case MFC_RdListStallStat:
 	{
+		if (ch_stall_stat.get_count())
+		{
+			u32 out = ch_stall_stat.get_value();
+			ch_stall_stat.set_value(0, false);
+			return out;
+		}
+
+		// Will stall infinitely
 		return read_channel(ch_stall_stat);
 	}
 
 	case SPU_RdDec:
 	{
-		out = ch_dec_value - (u32)(get_timebased_time() - ch_dec_start_timestamp);
+		u32 out = ch_dec_value - (u32)(get_timebased_time() - ch_dec_start_timestamp);
 
 		//Polling: We might as well hint to the scheduler to slot in another thread since this one is counting down
 		if (g_cfg.core.spu_loop_detection && out > spu::scheduler::native_jiffy_duration_us)
 			std::this_thread::yield();
 
-		return true;
+		return out;
 	}
 
 	case SPU_RdEventMask:
 	{
-		out = ch_event_mask;
-		return true;
+		return ch_event_mask;
 	}
 
 	case SPU_RdEventStat:
@@ -1129,42 +1681,54 @@ bool SPUThread::get_ch_value(u32 ch, u32& out)
 
 		if (res)
 		{
-			out = res;
-			return true;
+			return res;
 		}
 
-		vm::waiter waiter;
+		const u32 mask1 = ch_event_mask;
 
-		if (ch_event_mask & SPU_EVENT_LR)
+		if (mask1 & SPU_EVENT_LR && raddr)
 		{
-			waiter.owner = this;
-			waiter.addr = raddr;
-			waiter.size = 128;
-			waiter.stamp = rtime;
-			waiter.data = rdata.data();
-			waiter.init();
+			if (mask1 != SPU_EVENT_LR && mask1 != SPU_EVENT_LR + SPU_EVENT_TM)
+			{
+				// Combining LR with other flags needs another solution
+				fmt::throw_exception("Not supported: event mask 0x%x" HERE, mask1);
+			}
+
+			std::shared_lock<notifier> pseudo_lock(vm::reservation_notifier(raddr, 128), std::try_to_lock);
+
+			verify(HERE), pseudo_lock;
+
+			while (res = get_events(), !res)
+			{
+				if (test(state, cpu_flag::stop + cpu_flag::dbg_global_stop))
+				{
+					return -1;
+				}
+
+				pseudo_lock.mutex()->wait(100);
+			}
+
+			return res;
 		}
 
-		while (!(res = get_events(true)))
+		while (res = get_events(true), !res)
 		{
 			if (test(state & cpu_flag::stop))
 			{
-				return false;
+				return -1;
 			}
 
 			thread_ctrl::wait_for(100);
 		}
-		
-		out = res;
-		return true;
+
+		return res;
 	}
 
 	case SPU_RdMachStat:
 	{
 		// HACK: "Not isolated" status
 		// Return SPU Interrupt status in LSB
-		out = (ch_event_stat & SPU_EVENT_INTR_ENABLED) != 0;
-		return true;
+		return interrupts_enabled == true;
 	}
 	}
 
@@ -1180,9 +1744,9 @@ bool SPUThread::set_ch_value(u32 ch, u32 value)
 	case SPU_WrSRR0:
 	{
 		srr0 = value;
-		break;
+		return true;
 	}
-		
+
 	case SPU_WrOutIntrMbox:
 	{
 		if (offset >= RAW_SPU_BASE_ADDR)
@@ -1200,7 +1764,7 @@ bool SPUThread::set_ch_value(u32 ch, u32 value)
 			int_ctrl[2].set(SPU_INT2_STAT_MAILBOX_INT);
 			return true;
 		}
-		
+
 		const u32 code = value >> 24;
 		{
 			if (code < 64)
@@ -1349,6 +1913,23 @@ bool SPUThread::set_ch_value(u32 ch, u32 value)
 	case MFC_WrTagMask:
 	{
 		ch_tag_mask = value;
+
+		if (ch_tag_upd)
+		{
+			const u32 completed = get_mfc_completed();
+
+			if (completed && ch_tag_upd == 1)
+			{
+				ch_tag_stat.set_value(completed);
+				ch_tag_upd = 0;
+			}
+			else if (completed == value && ch_tag_upd == 2)
+			{
+				ch_tag_stat.set_value(completed);
+				ch_tag_upd = 0;
+			}
+		}
+
 		return true;
 	}
 
@@ -1359,42 +1940,27 @@ bool SPUThread::set_ch_value(u32 ch, u32 value)
 			break;
 		}
 
-		ch_tag_stat.set_value(0, false);
-		ch_tag_upd = value;
+		const u32 completed = get_mfc_completed();
 
-		if (ch_tag_mask == 0)
+		if (!value)
 		{
-			// TODO
-			ch_tag_stat.set_value(0);
+			ch_tag_upd = 0;
+			ch_tag_stat.set_value(completed);
 		}
-		else if (mfc_queue.size() == 0 && (!value || ch_tag_upd.exchange(0)))
+		else if (completed && value == 1)
 		{
-			ch_tag_stat.set_value(ch_tag_mask);
+			ch_tag_upd = 0;
+			ch_tag_stat.set_value(completed);
 		}
-		else if (!value)
+		else if (completed == ch_tag_mask && value == 2)
 		{
-			u32 completed = ch_tag_mask;
-
-			for (u32 i = 0; completed && i < 16; i++)
-			{
-				const auto& _cmd = mfc_queue.get_push(i);
-
-				if (_cmd.size)
-				{
-					completed &= ~(1u << _cmd.tag);
-				}
-			}
-
+			ch_tag_upd = 0;
 			ch_tag_stat.set_value(completed);
 		}
 		else
 		{
-			auto mfc = fxm::check_unlocked<mfc_thread>();
-			
-			//if (test(mfc->state, cpu_flag::is_waiting))
-			{
-				mfc->notify();
-			}
+			ch_tag_upd = value;
+			ch_tag_stat.set_value(0, false);
 		}
 
 		return true;
@@ -1420,35 +1986,28 @@ bool SPUThread::set_ch_value(u32 ch, u32 value)
 
 	case MFC_Size:
 	{
-		ch_mfc_cmd.size = value & 0xffff;
+		ch_mfc_cmd.size = value & 0x7fff;
 		return true;
 	}
 
 	case MFC_TagID:
 	{
-		ch_mfc_cmd.tag = value & 0xff;
+		ch_mfc_cmd.tag = value & 0x1f;
 		return true;
 	}
 
 	case MFC_Cmd:
 	{
 		ch_mfc_cmd.cmd = MFC(value & 0xff);
-		process_mfc_cmd();
-		ch_mfc_cmd = {}; // clear non-persistent data
-		return true;
+		return process_mfc_cmd(ch_mfc_cmd);
 	}
 
 	case MFC_WrListStallAck:
 	{
 		// Reset stall status for specified tag
-		if (atomic_storage<u32>::btr(ch_stall_mask.raw(), value))
+		if (::test_and_reset(ch_stall_mask, 1u << value))
 		{
-			auto mfc = fxm::check_unlocked<mfc_thread>();
-			
-			//if (test(mfc->state, cpu_flag::is_waiting))
-			{
-				mfc->notify();
-			}
+			do_mfc(true);
 		}
 
 		return true;
@@ -1463,29 +2022,12 @@ bool SPUThread::set_ch_value(u32 ch, u32 value)
 
 	case SPU_WrEventMask:
 	{
-		// detect masking events with enabled interrupt status
-		if (value & ~SPU_EVENT_INTR_IMPLEMENTED && ch_event_stat & SPU_EVENT_INTR_ENABLED)
-		{
-			fmt::throw_exception("SPU Interrupts not implemented (mask=0x%x)" HERE, value);
-		}
-
-		// detect masking unimplemented events
-		if (value & ~SPU_EVENT_IMPLEMENTED)
-		{
-			break;
-		}
-
 		ch_event_mask = value;
 		return true;
 	}
 
 	case SPU_WrEventAck:
 	{
-		if (value & ~SPU_EVENT_IMPLEMENTED)
-		{
-			break;
-		}
-
 		ch_event_stat &= ~value;
 		return true;
 	}
@@ -1684,7 +2226,7 @@ bool SPUThread::stop_and_signal(u32 code)
 		}
 
 		semaphore_lock lock(group->mutex);
-		
+
 		if (group->run_state == SPU_THREAD_GROUP_STATUS_WAITING)
 		{
 			group->run_state = SPU_THREAD_GROUP_STATUS_RUNNING;
@@ -1707,6 +2249,17 @@ bool SPUThread::stop_and_signal(u32 code)
 			}
 		}
 
+		return true;
+	}
+
+	case 0x100:
+	{
+		if (ch_out_mbox.get_count())
+		{
+			fmt::throw_exception("STOP code 0x100: Out_MBox is not empty" HERE);
+		}
+
+		_mm_mfence();
 		return true;
 	}
 

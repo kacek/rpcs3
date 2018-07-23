@@ -12,38 +12,37 @@
 
 #include "memory_viewer_panel.h"
 #include "table_item_delegate.h"
+#include "gui_settings.h"
 
-#include <QDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QHBoxLayout>
-#include <QKeyEvent>
+#include <QEvent>
 #include <QTabWidget>
 #include <QListWidget>
 #include <QTableWidget>
 #include <QHeaderView>
-#include <QPalette>
 #include <QFont>
 #include <QSignalMapper>
 #include <QPixmap>
 
-class Buffer : public QWidget
+class Buffer : public QGroupBox
 {
-	QHBoxLayout* m_layout;
-	QImage m_scaled;
+	Q_OBJECT
+
+	const QSize Panel_Size = QSize(108, 108);
+	const QSize Texture_Size = QSize(108, 108);
+
 	u32 m_id;
 	bool m_isTex;
+	QImage m_image;
+	QLabel* m_canvas;
+	QSize m_image_size;
 
 public:
-	QLabel* m_canvas;
-	QImage m_image;
-
-	Buffer(QWidget* parent, bool isTex, u32 id = 4)
-		: QWidget(parent), m_isTex(isTex), m_id(id){};
+	Buffer(bool isTex, u32 id, const QString& name, QWidget* parent = 0);
 	void showImage(const QImage& image = QImage());
-
-private:
-	void mouseDoubleClickEvent(QMouseEvent* event);
+	void ShowWindowed();
 };
 
 class rsx_debugger : public QDialog
@@ -52,19 +51,8 @@ class rsx_debugger : public QDialog
 
 	u32 m_addr;
 
-	u32 m_panel_width;
-	u32 m_panel_height;
-	u32 m_text_width;
-	u32 m_text_height;
+	QLineEdit* m_addr_line;
 
-	u32 pSize;
-
-	QLineEdit* t_addr;
-	QPalette palette_bg;
-	QFont mono;
-	QFontMetrics* fontMetrics;
-
-	u32 m_item_count;
 	QTableWidget* m_list_commands;
 	QTableWidget* m_list_captured_frame;
 	QTableWidget* m_list_captured_draw_calls;
@@ -73,6 +61,7 @@ class rsx_debugger : public QDialog
 	QTableWidget* m_list_texture;
 	QTableWidget* m_list_settings;
 	QListWidget* m_list_index_buffer;
+	QTabWidget* m_tw_rsx;
 
 	Buffer* m_buffer_colorA;
 	Buffer* m_buffer_colorB;
@@ -87,13 +76,12 @@ class rsx_debugger : public QDialog
 
 	uint m_cur_texture;
 
+	std::shared_ptr<gui_settings> m_gui_settings;
+
 public:
 	bool exit;
-	rsx_debugger(QWidget* parent);
-	~rsx_debugger()
-	{
-		exit = true;
-	}
+	rsx_debugger(std::shared_ptr<gui_settings> gui_settings, QWidget* parent = 0);
+	~rsx_debugger();
 
 	virtual void UpdateInformation();
 	virtual void GetMemory();
@@ -106,15 +94,18 @@ public:
 	const char* ParseGCMEnum(u32 value, u32 type);
 	QString DisAsmCommand(u32 cmd, u32 count, u32 currentAddr, u32 ioAddr);
 
-	void SetPC(const uint pc) { m_addr = pc; }
-
-private:
-	QSignalMapper *signalMapper;
+	void SetPC(const uint pc);
 
 public Q_SLOTS:
-	virtual void keyPressEvent(QKeyEvent* event);
-	virtual void wheelEvent(QWheelEvent* event);
 	virtual void OnClickDrawCalls();
 	virtual void SetFlags();
 	virtual void SetPrograms();
+
+protected:
+	virtual void closeEvent(QCloseEvent* event) override;
+	virtual void keyPressEvent(QKeyEvent* event) override;
+	virtual bool eventFilter(QObject* object, QEvent* event) override;
+
+private:
+	void PerformJump(u32 address);
 };

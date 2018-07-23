@@ -9,10 +9,10 @@
 #include "Emu/Cell/lv2/sys_lwcond.h"
 #include "Emu/Cell/lv2/sys_event_flag.h"
 
-namespace vm { using namespace ps3; }
+
 
 // Error Codes
-enum
+enum CellLv2DbgError : u32
 {
 	CELL_LV2DBG_ERROR_DEINVALIDPROCESSID = 0x80010401,
 	CELL_LV2DBG_ERROR_DEINVALIDTHREADID = 0x80010402,

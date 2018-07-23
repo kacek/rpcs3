@@ -41,7 +41,7 @@ static u32 spu_decode(u32 inst)
 }
 
 // SPU decoder object. D provides functions. T is function pointer type returned.
-template<typename D, typename T = decltype(&D::UNK)>
+template <typename D, typename T = decltype(&D::UNK)>
 class spu_decoder
 {
 	// Fast lookup table
@@ -52,6 +52,20 @@ class spu_decoder
 		u32 magn; // Count = 2 ^ magn
 		u32 value;
 		T pointer;
+
+		instruction_info(u32 m, u32 v, T p)
+			: magn(m)
+			, value(v)
+			, pointer(p)
+		{
+		}
+
+		instruction_info(u32 m, u32 v, const T* p)
+			: magn(m)
+			, value(v)
+			, pointer(*p)
+		{
+		}
 	};
 
 public:
@@ -269,6 +283,12 @@ public:
 				m_table[entry.value << entry.magn | i] = entry.pointer;
 			}
 		}
+	}
+
+	template <typename F>
+	spu_decoder(F&& init) : spu_decoder()
+	{
+		init(m_table);
 	}
 
 	const std::array<T, 2048>& get_table() const

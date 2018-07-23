@@ -17,27 +17,34 @@
 #include "Emu/RSX/CgBinaryProgram.h"
 
 constexpr auto qstr = QString::fromStdString;
-inline std::string sstr(const QString& _in) { return _in.toUtf8().toStdString(); }
+inline std::string sstr(const QString& _in) { return _in.toStdString(); }
 
 cg_disasm_window::cg_disasm_window(std::shared_ptr<gui_settings> xSettings): xgui_settings(xSettings)
 {
 	setWindowTitle(tr("Cg Disasm"));
+	setObjectName("cg_disasm");
 	setAttribute(Qt::WA_DeleteOnClose);
 	setAcceptDrops(true);
 	setMinimumSize(QSize(200, 150)); // seems fine on win 10
 	resize(QSize(620, 395));
 
-	m_path_last = xgui_settings->GetValue(GUI::fd_cg_disasm).toString();
+	m_path_last = xgui_settings->GetValue(gui::fd_cg_disasm).toString();
 	
 	m_disasm_text = new QTextEdit(this);
 	m_disasm_text->setReadOnly(true);
 	m_disasm_text->setWordWrapMode(QTextOption::NoWrap);
 	m_disasm_text->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-	
+
 	m_glsl_text = new QTextEdit(this);
 	m_glsl_text->setReadOnly(true);
 	m_glsl_text->setWordWrapMode(QTextOption::NoWrap);
 	m_glsl_text->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+
+	// m_disasm_text syntax highlighter
+	sh_asm = new AsmHighlighter(m_disasm_text->document());
+
+	// m_glsl_text syntax highlighter
+	sh_glsl = new GlslHighlighter(m_glsl_text->document());
 
 	QSplitter* splitter = new QSplitter();
 	splitter->addWidget(m_disasm_text);
@@ -66,9 +73,14 @@ void cg_disasm_window::ShowContextMenu(const QPoint &pos)
 	myMenu.addSeparator();
 	myMenu.addAction(clear);
 
-	auto l_clear = [=]() {m_disasm_text->clear(); m_glsl_text->clear();};
-	connect(clear, &QAction::triggered, l_clear);
-	connect(open, &QAction::triggered, [=] {
+	connect(clear, &QAction::triggered, [=]
+	{
+		m_disasm_text->clear();
+		m_glsl_text->clear();
+	});
+
+	connect(open, &QAction::triggered, [=]
+	{
 		QString filePath = QFileDialog::getOpenFileName(this, tr("Select Cg program object"), m_path_last, tr("Cg program objects (*.fpo;*.vpo);;"));
 		if (filePath == NULL) return;
 		m_path_last = filePath;
@@ -86,7 +98,7 @@ void cg_disasm_window::ShowDisasm()
 		disasm.BuildShaderBody();
 		m_disasm_text->setText(qstr(disasm.GetArbShader()));
 		m_glsl_text->setText(qstr(disasm.GetGlslShader()));
-		xgui_settings->SetValue(GUI::fd_cg_disasm, m_path_last);
+		xgui_settings->SetValue(gui::fd_cg_disasm, m_path_last);
 	}
 	else if (!m_path_last.isEmpty())
 	{

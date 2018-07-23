@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
 #include "Emu/Cell/PPUModule.h"
@@ -100,11 +100,8 @@ void fmt_class_string<CellSysutilLang>::format(std::string& out, u64 arg)
 	});
 }
 
-// For test
-enum systemparam_id_name : s32 {};
-
 template <>
-void fmt_class_string<systemparam_id_name>::format(std::string& out, u64 arg)
+void fmt_class_string<CellSysutilParamId>::format(std::string& out, u64 arg)
 {
 	format_enum(out, arg, [](auto value)
 	{
@@ -133,13 +130,13 @@ void fmt_class_string<systemparam_id_name>::format(std::string& out, u64 arg)
 	});
 }
 
-s32 cellSysutilGetSystemParamInt(systemparam_id_name id, vm::ptr<s32> value)
+s32 cellSysutilGetSystemParamInt(CellSysutilParamId id, vm::ptr<s32> value)
 {
 	cellSysutil.warning("cellSysutilGetSystemParamInt(id=0x%x(%s), value=*0x%x)", id, id, value);
 
 	// TODO: load this information from config (preferably "sys/" group)
 
-	switch(id)
+	switch (id)
 	{
 	case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
 		*value = g_cfg.sys.language;
@@ -201,6 +198,10 @@ s32 cellSysutilGetSystemParamInt(systemparam_id_name id, vm::ptr<s32> value)
 		*value = 0;
 	break;
 
+	case CELL_SYSUTIL_SYSTEMPARAM_ID_MAGNETOMETER:
+		*value = 0;
+	break;
+
 	default:
 		return CELL_EINVAL;
 	}
@@ -208,13 +209,13 @@ s32 cellSysutilGetSystemParamInt(systemparam_id_name id, vm::ptr<s32> value)
 	return CELL_OK;
 }
 
-s32 cellSysutilGetSystemParamString(systemparam_id_name id, vm::ptr<char> buf, u32 bufsize)
+s32 cellSysutilGetSystemParamString(CellSysutilParamId id, vm::ptr<char> buf, u32 bufsize)
 {
 	cellSysutil.trace("cellSysutilGetSystemParamString(id=0x%x(%s), buf=*0x%x, bufsize=%d)", id, id, buf, bufsize);
 
 	memset(buf.get_ptr(), 0, bufsize);
 
-	switch(id)
+	switch (id)
 	{
 	case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME:
 		memcpy(buf.get_ptr(), "Unknown", 8); // for example
@@ -282,18 +283,32 @@ s32 cellSysutilUnregisterCallback(u32 slot)
 	return CELL_OK;
 }
 
-s32 cellSysCacheClear(void)
+s32 cellSysCacheClear()
 {
-	cellSysutil.todo("cellSysCacheClear()");
 
-	if (!fxm::check<CellSysCacheParam>())
+	cellSysutil.warning("cellSysCacheClear()");
+
+	// Get the param as a shared ptr, then decipher the cacheid from it
+	// (Instead of assuming naively that the param is passed as argument)
+	std::shared_ptr<CellSysCacheParam> param = fxm::get<CellSysCacheParam>();
+
+	// Unit test for param ptr, since it may be null at the time of get()
+	if (!param)
 	{
 		return CELL_SYSCACHE_ERROR_NOTMOUNTED;
 	}
 
-	const std::string& local_path = vfs::get("/dev_hdd1/cache/");
+	const std::string& cache_id = param->cacheId;
 
-	// TODO: Write tests to figure out, what is deleted.
+	const std::string& cache_path = "/dev_hdd1/cache/" + cache_id;
+	const std::string& dir_path = vfs::get(cache_path);
+
+	if (!fs::exists(dir_path) || !fs::is_dir(dir_path))
+	{
+		return CELL_SYSCACHE_ERROR_ACCESS_ERROR;
+	}
+
+	fs::remove_all(dir_path, false);
 
 	return CELL_SYSCACHE_RET_OK_CLEARED;
 }
@@ -304,15 +319,18 @@ s32 cellSysCacheMount(vm::ptr<CellSysCacheParam> param)
 
 	const std::string& cache_id = param->cacheId;
 	verify(HERE), cache_id.size() < sizeof(param->cacheId);
-	
-	const std::string& cache_path = "/dev_hdd1/cache/" + cache_id + '/';
+
+	const std::string& cache_path = "/dev_hdd1/cache/" + cache_id;
 	strcpy_trunc(param->getCachePath, cache_path);
 
 	// TODO: implement (what?)
-	fs::create_dir(vfs::get(cache_path));
 	fxm::make_always<CellSysCacheParam>(*param);
+	if (!fs::create_dir(vfs::get(cache_path)))
+	{
+		return CELL_SYSCACHE_RET_OK_RELAYED;
+	}
 
-	return CELL_SYSCACHE_RET_OK_RELAYED;
+	return CELL_SYSCACHE_RET_OK_CLEARED;
 }
 
 bool g_bgm_playback_enabled = true;
@@ -332,7 +350,7 @@ s32 cellSysutilEnableBgmPlaybackEx(vm::ptr<CellSysutilBgmPlaybackExtraParam> par
 	cellSysutil.warning("cellSysutilEnableBgmPlaybackEx(param=*0x%x)", param);
 
 	// TODO
-	g_bgm_playback_enabled = true; 
+	g_bgm_playback_enabled = true;
 
 	return CELL_OK;
 }
@@ -477,6 +495,18 @@ s32 _ZN4cxml8Document5ClearEv()
 	return CELL_OK;
 }
 
+s32 _ZN4cxml8Document5WriteEPFiPKvjPvES3_()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
+s32 _ZN4cxml8Document12RegisterFileEPKvjPNS_4FileE()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
 s32 _ZN4cxml8Document13CreateElementEPKciPNS_7ElementE()
 {
 	UNIMPLEMENTED_FUNC(cellSysutil);
@@ -544,6 +574,12 @@ s32 _ZN8cxmlutil6SetIntERKN4cxml7ElementEPKci()
 }
 
 s32 _ZN8cxmlutil6GetIntERKN4cxml7ElementEPKcPi()
+{
+	UNIMPLEMENTED_FUNC(cellSysutil);
+	return CELL_OK;
+}
+
+s32 _ZN8cxmlutil7SetFileERKN4cxml7ElementEPKcRKNS0_4FileE()
 {
 	UNIMPLEMENTED_FUNC(cellSysutil);
 	return CELL_OK;
@@ -685,6 +721,8 @@ DECLARE(ppu_module_manager::cellSysutil)("cellSysutil", []()
 	REG_FUNC(cellSysutil, _ZN4cxml8DocumentC1Ev);
 	REG_FUNC(cellSysutil, _ZN4cxml8DocumentD1Ev);
 	REG_FUNC(cellSysutil, _ZN4cxml8Document5ClearEv);
+	REG_FUNC(cellSysutil, _ZN4cxml8Document5WriteEPFiPKvjPvES3_);
+	REG_FUNC(cellSysutil, _ZN4cxml8Document12RegisterFileEPKvjPNS_4FileE);
 	REG_FUNC(cellSysutil, _ZN4cxml8Document13CreateElementEPKciPNS_7ElementE);
 	REG_FUNC(cellSysutil, _ZN4cxml8Document14SetHeaderMagicEPKc);
 	REG_FUNC(cellSysutil, _ZN4cxml8Document16CreateFromBufferEPKvjb);
@@ -699,18 +737,19 @@ DECLARE(ppu_module_manager::cellSysutil)("cellSysutil", []()
 
 	REG_FUNC(cellSysutil, _ZN8cxmlutil6SetIntERKN4cxml7ElementEPKci);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil6GetIntERKN4cxml7ElementEPKcPi);
+	REG_FUNC(cellSysutil, _ZN8cxmlutil7SetFileERKN4cxml7ElementEPKcRKNS0_4FileE);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil8GetFloatERKN4cxml7ElementEPKcPf);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil9GetStringERKN4cxml7ElementEPKcPS5_Pj);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil9SetStringERKN4cxml7ElementEPKcS5_);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil16CheckElementNameERKN4cxml7ElementEPKc);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil16FindChildElementERKN4cxml7ElementEPKcS5_S5_);
 	REG_FUNC(cellSysutil, _ZN8cxmlutil7GetFileERKN4cxml7ElementEPKcPNS0_4FileE);
-	
+
 	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil11FixedMemory3EndEi);
 	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil11FixedMemory5BeginEi);
 	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil11FixedMemory8AllocateEN4cxml14AllocationTypeEPvS3_jPS3_Pj);
 	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil12PacketWriter5WriteEPKvjPv);
 	REG_FUNC(cellSysutil, _ZN16sysutil_cxmlutil12PacketWriterC1EiiRN4cxml8DocumentE);
-	
+
 	REG_FNID(cellSysutil, 0xE1EC7B6A, cellSysutil_E1EC7B6A);
 });

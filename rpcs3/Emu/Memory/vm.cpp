@@ -2,29 +2,17 @@
 #include "Memory.h"
 #include "Emu/System.h"
 #include "Utilities/mutex.h"
+#include "Utilities/cond.h"
 #include "Utilities/Thread.h"
 #include "Utilities/VirtualMemory.h"
 #include "Emu/CPU/CPUThread.h"
 #include "Emu/Cell/lv2/sys_memory.h"
 #include "Emu/RSX/GSRender.h"
-
-#ifdef _WIN32
-#include <Windows.h>
-#else
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/types.h>
-
-/* OS X uses MAP_ANON instead of MAP_ANONYMOUS */
-#ifndef MAP_ANONYMOUS
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-#endif
-
 #include <atomic>
+#include <thread>
 #include <deque>
+
+static_assert(sizeof(notifier) == 8, "Unexpected size of notifier");
 
 namespace vm
 {
@@ -48,14 +36,17 @@ namespace vm
 	// Auxiliary virtual memory for executable areas
 	u8* const g_exec_addr = memory_reserve_4GiB((std::uintptr_t)g_base_addr);
 
+	// Stats for debugging
+	u8* const g_stat_addr = memory_reserve_4GiB((std::uintptr_t)g_exec_addr);
+
+	// Reservation stats (compressed x16)
+	u8* const g_reservations = memory_reserve_4GiB((std::uintptr_t)g_stat_addr);
+
+	// Reservation sync variables
+	u8* const g_reservations2 = g_reservations + 0x10000000;
+
 	// Memory locations
 	std::vector<std::shared_ptr<block_t>> g_locations;
-
-	// Reservations (lock lines) in a single memory page
-	using reservation_info = std::array<std::atomic<u64>, 4096 / 128>;
-
-	// Registered waiters
-	std::deque<vm::waiter*> g_waiters;
 
 	// Memory mutex core
 	shared_mutex g_mutex;
@@ -78,25 +69,56 @@ namespace vm
 		}
 	}
 
-	void passive_lock(cpu_thread& cpu)
+	bool passive_lock(cpu_thread& cpu, bool wait)
 	{
-		if (g_tls_locked && *g_tls_locked == &cpu)
+		if (UNLIKELY(g_tls_locked && *g_tls_locked == &cpu))
 		{
-			return;
+			return true;
 		}
 
-		::reader_lock lock(g_mutex);
+		if (LIKELY(g_mutex.is_lockable()))
+		{
+			// Optimistic path (hope that mutex is not exclusively locked)
+			_register_lock(&cpu);
 
-		_register_lock(&cpu);
+			if (UNLIKELY(!g_mutex.is_lockable()))
+			{
+				passive_unlock(cpu);
+
+				if (!wait)
+				{
+					return false;
+				}
+
+				::reader_lock lock(g_mutex);
+				_register_lock(&cpu);
+			}
+		}
+		else
+		{
+			if (!wait)
+			{
+				return false;
+			}
+
+			::reader_lock lock(g_mutex);
+			_register_lock(&cpu);
+		}
+
+		return true;
 	}
 
 	void passive_unlock(cpu_thread& cpu)
 	{
-		if (g_tls_locked)
+		if (auto& ptr = g_tls_locked)
 		{
-			g_tls_locked->compare_and_swap_test(&cpu, nullptr);
-			::reader_lock lock(g_mutex);
-			g_tls_locked = nullptr;
+			*ptr = nullptr;
+			ptr = nullptr;
+
+			if (test(cpu.state, cpu_flag::memory))
+			{
+				cpu.state -= cpu_flag::memory;
+			}
 		}
 	}
 
@@ -121,7 +143,7 @@ namespace vm
 	{
 		if (g_tls_locked && g_tls_locked->compare_and_swap_test(&cpu, nullptr))
 		{
-			cpu.state.test_and_set(cpu_flag::memory);
+			cpu.cpu_unmem();
 		}
 	}
 
@@ -142,7 +164,7 @@ namespace vm
 		{
 			cpu = nullptr;
 		}
-		
+
 		g_mutex.lock_shared();
 
 		if (cpu)
@@ -150,11 +172,6 @@ namespace vm
 			_register_lock(cpu);
 			cpu->state -= cpu_flag::memory;
 		}
-	}
-
-	reader_lock::reader_lock(const try_to_lock_t&)
-		: locked(g_mutex.try_lock_shared())
-	{
 	}
 
 	reader_lock::~reader_lock()
@@ -208,11 +225,6 @@ namespace vm
 		}
 	}
 
-	writer_lock::writer_lock(const try_to_lock_t&)
-		: locked(g_mutex.try_lock())
-	{
-	}
-
 	writer_lock::~writer_lock()
 	{
 		if (locked)
@@ -221,121 +233,40 @@ namespace vm
 		}
 	}
 
+	void reservation_lock_internal(atomic_t<u64>& res)
+	{
+		for (u64 i = 0;; i++)
+		{
+			if (LIKELY(!atomic_storage<u64>::bts(res.raw(), 0)))
+			{
+				break;
+			}
+
+			if (i < 15)
+			{
+				busy_wait(500);
+			}
+			else
+			{
+				std::this_thread::yield();
+			}
+		}
+	}
+
 	// Page information
 	struct memory_page
 	{
 		// Memory flags
 		atomic_t<u8> flags;
-
-		atomic_t<u32> waiters;
-
-		// Reservations
-		atomic_t<reservation_info*> reservations;
-
-		// Access reservation info
-		std::atomic<u64>& operator [](u32 addr)
-		{
-			auto ptr = reservations.load();
-
-			if (!ptr)
-			{
-				// Opportunistic memory allocation
-				ptr = new reservation_info{};
-
-				if (auto old_ptr = reservations.compare_and_swap(nullptr, ptr))
-				{
-					delete ptr;
-					ptr = old_ptr;
-				}
-			}
-
-			return (*ptr)[(addr & 0xfff) >> 7];
-		}
 	};
 
 	// Memory pages
 	std::array<memory_page, 0x100000000 / 4096> g_pages{};
 
-	u64 reservation_acquire(u32 addr, u32 _size)
+	static void _page_map(u32 addr, u8 flags, utils::shm& shm)
 	{
-		// Access reservation info: stamp and the lock bit
-		return g_pages[addr >> 12][addr].load(std::memory_order_acquire);
-	}
+		const u32 size = shm.size();
 
-	void reservation_update(u32 addr, u32 _size)
-	{
-		// Update reservation info with new timestamp (unsafe, assume allocated)
-		(*g_pages[addr >> 12].reservations)[(addr & 0xfff) >> 7].store(__rdtsc(), std::memory_order_release);
-	}
-
-	void waiter::init()
-	{
-		// Register waiter
-		writer_lock lock(0);
-
-		g_waiters.emplace_back(this);
-	}
-
-	void waiter::test() const
-	{
-		if (std::memcmp(data, vm::base(addr), size) == 0)
-		{
-			return;
-		}
-
-		memory_page& page = g_pages[addr >> 12];
-
-		if (page.reservations == nullptr)
-		{
-			return;
-		}
-
-		if (stamp >= (*page.reservations)[(addr & 0xfff) >> 7].load())
-		{
-			return;
-		}
-
-		if (owner)
-		{
-			owner->notify();
-		}
-	}
-
-	waiter::~waiter()
-	{
-		// Unregister waiter
-		writer_lock lock(0);
-
-		// Find waiter
-		const auto found = std::find(g_waiters.cbegin(), g_waiters.cend(), this);
-
-		if (found != g_waiters.cend())
-		{
-			g_waiters.erase(found);
-		}
-	}
-
-	void notify(u32 addr, u32 size)
-	{
-		for (const waiter* ptr : g_waiters)
-		{
-			if (ptr->addr / 128 == addr / 128)
-			{
-				ptr->test();
-			}
-		}
-	}
-
-	void notify_all()
-	{
-		for (const waiter* ptr : g_waiters)
-		{
-			ptr->test();
-		}
-	}
-
-	void _page_map(u32 addr, u32 size, u8 flags)
-	{
 		if (!size || (size | addr) % 4096 || flags & page_allocated)
 		{
 			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
@@ -349,16 +280,20 @@ namespace vm
 			}
 		}
 
-		void* real_addr = g_base_addr + addr;
-		void* exec_addr = g_exec_addr + addr;
+		if (shm.map_critical(g_base_addr + addr) != g_base_addr + addr)
+		{
+			fmt::throw_exception("Memory mapping failed - blame Windows (addr=0x%x, size=0x%x, flags=0x%x)", addr, size, flags);
+		}
 
-#ifdef _WIN32
-		auto protection = flags & page_writable ? PAGE_READWRITE : (flags & page_readable ? PAGE_READONLY : PAGE_NOACCESS);
-		verify(__func__), ::VirtualAlloc(real_addr, size, MEM_COMMIT, protection);
-#else
-		auto protection = flags & page_writable ? PROT_WRITE | PROT_READ : (flags & page_readable ? PROT_READ : PROT_NONE);
-		verify(__func__), !::mprotect(real_addr, size, protection), !::madvise(real_addr, size, MADV_WILLNEED);
-#endif
+		if (flags & page_executable)
+		{
+			utils::memory_commit(g_exec_addr + addr, size);
+		}
+
+		if (g_cfg.core.ppu_debug)
+		{
+			utils::memory_commit(g_stat_addr + addr, size);
+		}
 
 		for (u32 i = addr / 4096; i < addr / 4096 + size / 4096; i++)
 		{
@@ -371,7 +306,7 @@ namespace vm
 
 	bool page_protect(u32 addr, u32 size, u8 flags_test, u8 flags_set, u8 flags_clear)
 	{
-		writer_lock lock;
+		vm::writer_lock lock(0);
 
 		if (!size || (size | addr) % 4096)
 		{
@@ -415,15 +350,8 @@ namespace vm
 			{
 				if (u32 page_size = (i - start) * 4096)
 				{
-#ifdef _WIN32
-					DWORD old;
-
-					auto protection = start_value & page_writable ? PAGE_READWRITE : (start_value & page_readable ? PAGE_READONLY : PAGE_NOACCESS);
-					verify(__func__), ::VirtualProtect(vm::base(start * 4096), page_size, protection, &old);
-#else
-					auto protection = start_value & page_writable ? PROT_WRITE | PROT_READ : (start_value & page_readable ? PROT_READ : PROT_NONE);
-					verify(__func__), !::mprotect(vm::base(start * 4096), page_size, protection);
-#endif
+					const auto protection = start_value & page_writable ? utils::protection::rw : (start_value & page_readable ? utils::protection::ro : utils::protection::no);
+					utils::memory_protect(g_base_addr + start * 4096, page_size, protection);
 				}
 
 				start_value = new_val;
@@ -434,18 +362,27 @@ namespace vm
 		return true;
 	}
 
-	void _page_unmap(u32 addr, u32 size)
+	static void _page_unmap(u32 addr, utils::shm& shm)
 	{
+		const u32 size = shm.size();
+
 		if (!size || (size | addr) % 4096)
 		{
 			fmt::throw_exception("Invalid arguments (addr=0x%x, size=0x%x)" HERE, addr, size);
 		}
+
+		bool is_exec = false;
 
 		for (u32 i = addr / 4096; i < addr / 4096 + size / 4096; i++)
 		{
 			if ((g_pages[i].flags & page_allocated) == 0)
 			{
 				fmt::throw_exception("Memory not mapped (addr=0x%x, size=0x%x, current_addr=0x%x)" HERE, addr, size, i * 4096);
+			}
+
+			if (g_pages[i].flags & page_executable)
+			{
+				is_exec = true;
 			}
 		}
 
@@ -457,16 +394,17 @@ namespace vm
 			}
 		}
 
-		void* real_addr = g_base_addr + addr;
-		void* exec_addr = g_exec_addr + addr;
+		shm.unmap_critical(g_base_addr + addr);
 
-#ifdef _WIN32
-		verify(__func__), ::VirtualFree(real_addr, size, MEM_DECOMMIT);
-		verify(__func__), ::VirtualFree(exec_addr, size, MEM_DECOMMIT);
-#else
-		verify(__func__), ::mmap(real_addr, size, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-		verify(__func__), ::mmap(exec_addr, size, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-#endif
+		if (is_exec)
+		{
+			utils::memory_decommit(g_exec_addr + addr, size);
+		}
+
+		if (g_cfg.core.ppu_debug)
+		{
+			utils::memory_decommit(g_stat_addr + addr, size);
+		}
 	}
 
 	bool check_addr(u32 addr, u32 size, u8 flags)
@@ -478,11 +416,11 @@ namespace vm
 				return false;
 			}
 		}
-		
+
 		return true;
 	}
 
-	u32 alloc(u32 size, memory_location_t location, u32 align, u32 sup)
+	u32 alloc(u32 size, memory_location_t location, u32 align)
 	{
 		const auto block = get(location);
 
@@ -491,10 +429,10 @@ namespace vm
 			fmt::throw_exception("Invalid memory location (%u)" HERE, (uint)location);
 		}
 
-		return block->alloc(size, align, sup);
+		return block->alloc(size, align);
 	}
 
-	u32 falloc(u32 addr, u32 size, memory_location_t location, u32 sup)
+	u32 falloc(u32 addr, u32 size, memory_location_t location)
 	{
 		const auto block = get(location, addr);
 
@@ -503,10 +441,10 @@ namespace vm
 			fmt::throw_exception("Invalid memory location (%u, addr=0x%x)" HERE, (uint)location, addr);
 		}
 
-		return block->falloc(addr, size, sup);
+		return block->falloc(addr, size);
 	}
 
-	u32 dealloc(u32 addr, memory_location_t location, u32* sup_out)
+	u32 dealloc(u32 addr, memory_location_t location)
 	{
 		const auto block = get(location, addr);
 
@@ -515,7 +453,7 @@ namespace vm
 			fmt::throw_exception("Invalid memory location (%u, addr=0x%x)" HERE, (uint)location, addr);
 		}
 
-		return block->dealloc(addr, sup_out);
+		return block->dealloc(addr);
 	}
 
 	void dealloc_verbose_nothrow(u32 addr, memory_location_t location) noexcept
@@ -535,8 +473,10 @@ namespace vm
 		}
 	}
 
-	bool block_t::try_alloc(u32 addr, u32 size, u8 flags, u32 sup)
+	bool block_t::try_alloc(u32 addr, u8 flags, std::shared_ptr<utils::shm>&& shm)
 	{
+		const u32 size = shm->size();
+
 		// Check if memory area is already mapped
 		for (u32 i = addr / 4096; i <= (addr + size - 1) / 4096; i++)
 		{
@@ -547,13 +487,10 @@ namespace vm
 		}
 
 		// Map "real" memory pages
-		_page_map(addr, size, flags);
+		_page_map(addr, flags, *shm);
 
 		// Add entry
-		m_map[addr] = size;
-
-		// Add supplementary info if necessary
-		if (sup) m_sup[addr] = sup;
+		m_map[addr] = std::move(shm);
 
 		return true;
 	}
@@ -563,28 +500,62 @@ namespace vm
 		, size(size)
 		, flags(flags)
 	{
+		// Allocate compressed reservation info area (avoid SPU MMIO area)
+		if (addr != 0xe0000000)
+		{
+			// Beginning of the address space
+			if (addr == 0x10000)
+			{
+				utils::memory_commit(g_reservations, 0x1000);
+				utils::memory_commit(g_reservations2, 0x1000);
+			}
+
+			utils::memory_commit(g_reservations + addr / 16, size / 16);
+			utils::memory_commit(g_reservations2 + addr / 16, size / 16);
+		}
+		else
+		{
+			// RawSPU LS
+			for (u32 i = 0; i < 6; i++)
+			{
+				utils::memory_commit(g_reservations + addr / 16 + i * 0x10000, 0x4000);
+				utils::memory_commit(g_reservations2 + addr / 16 + i * 0x10000, 0x4000);
+			}
+
+			// End of the address space
+			utils::memory_commit(g_reservations + 0xfff0000, 0x10000);
+			utils::memory_commit(g_reservations2 + 0xfff0000, 0x10000);
+		}
 	}
 
 	block_t::~block_t()
 	{
-		writer_lock lock;
-
-		// Deallocate all memory
-		for (auto& entry : m_map)
 		{
-			_page_unmap(entry.first, entry.second);
+			vm::writer_lock lock(0);
+
+			// Deallocate all memory
+			for (auto& entry : m_map)
+			{
+				_page_unmap(entry.first, *entry.second);
+			}
+		}
+
+		// Notify rsx to invalidate range (TODO)
+		if (const auto rsxthr = fxm::check_unlocked<GSRender>())
+		{
+			rsxthr->on_notify_memory_unmapped(addr, size);
 		}
 	}
 
-	u32 block_t::alloc(u32 size, u32 align, u32 sup)
+	u32 block_t::alloc(const u32 orig_size, u32 align, const std::shared_ptr<utils::shm>* src)
 	{
-		writer_lock lock;
+		vm::writer_lock lock(0);
 
 		// Align to minimal page size
-		size = ::align(size, 4096);
+		const u32 size = ::align(orig_size, 0x10000);
 
 		// Check alignment (it's page allocation, so passing small values there is just silly)
-		if (align < 4096 || align != (0x80000000u >> cntlz32(align, true)))
+		if (align < 0x10000 || align != (0x80000000u >> cntlz32(align, true)))
 		{
 			fmt::throw_exception("Invalid alignment (size=0x%x, align=0x%x)" HERE, size, align);
 		}
@@ -606,10 +577,13 @@ namespace vm
 			pflags |= page_64k_size;
 		}
 
+		// Create or import shared memory object
+		std::shared_ptr<utils::shm> shm = src ? std::shared_ptr<utils::shm>(*src) : std::make_shared<utils::shm>(size);
+
 		// Search for an appropriate place (unoptimized)
 		for (u32 addr = ::align(this->addr, align); addr < this->addr + this->size - 1; addr += align)
 		{
-			if (try_alloc(addr, size, pflags, sup))
+			if (try_alloc(addr, pflags, std::move(shm)))
 			{
 				return addr;
 			}
@@ -618,19 +592,21 @@ namespace vm
 		return 0;
 	}
 
-	u32 block_t::falloc(u32 addr, u32 size, u32 sup)
+	u32 block_t::falloc(u32 addr, const u32 orig_size, const std::shared_ptr<utils::shm>* src)
 	{
-		writer_lock lock;
+		vm::writer_lock lock(0);
 
 		// align to minimal page size
-		size = ::align(size, 4096);
+		const u32 size = ::align(orig_size, 0x10000);
 
 		// return if addr or size is invalid
 		if (!size || size > this->size || addr < this->addr || addr + size - 1 > this->addr + this->size - 1)
 		{
 			return 0;
 		}
+
 		u8 pflags = page_readable | page_writable;
+
 		if ((flags & SYS_MEMORY_PAGE_SIZE_1M) == SYS_MEMORY_PAGE_SIZE_1M)
 		{
 			pflags |= page_1m_size;
@@ -640,7 +616,7 @@ namespace vm
 			pflags |= page_64k_size;
 		}
 
-		if (!try_alloc(addr, size, pflags, sup))
+		if (!try_alloc(addr, pflags, src ? std::shared_ptr<utils::shm>(*src) : std::make_shared<utils::shm>(size)))
 		{
 			return 0;
 		}
@@ -648,36 +624,73 @@ namespace vm
 		return addr;
 	}
 
-	u32 block_t::dealloc(u32 addr, u32* sup_out)
+	u32 block_t::dealloc(u32 addr, const std::shared_ptr<utils::shm>* src)
 	{
-		writer_lock lock;
-
-		const auto found = m_map.find(addr);
-
-		if (found != m_map.end())
+		u32 result = 0;
 		{
-			const u32 size = found->second;
-			const auto rsxthr = fxm::get<GSRender>();
+			vm::writer_lock lock(0);
+
+			const auto found = m_map.find(addr);
+
+			if (found == m_map.end())
+			{
+				return 0;
+			}
+
+			if (src && found->second.get() != src->get())
+			{
+				return 0;
+			}
+
+			result = found->second->size();
+
+			// Unmap "real" memory pages
+			_page_unmap(addr, *found->second);
 
 			// Remove entry
 			m_map.erase(found);
-
-			// Unmap "real" memory pages
-			_page_unmap(addr, size);
-
-			// Notify rsx to invalidate range
-			if (rsxthr != nullptr) rsxthr->on_notify_memory_unmapped(addr, size);
-
-			// Write supplementary info if necessary
-			if (sup_out) *sup_out = m_sup[addr];
-
-			// Remove supplementary info
-			m_sup.erase(addr);
-
-			return size;
 		}
 
-		return 0;
+		// Notify rsx to invalidate range (TODO)
+		if (const auto rsxthr = fxm::check_unlocked<GSRender>())
+		{
+			rsxthr->on_notify_memory_unmapped(addr, result);
+		}
+
+		return result;
+	}
+
+	std::pair<const u32, std::shared_ptr<utils::shm>> block_t::get(u32 addr, u32 size)
+	{
+		if (addr < this->addr || std::max<u32>(size, addr - this->addr + size) >= this->size)
+		{
+			return {addr, nullptr};
+		}
+
+		vm::reader_lock lock;
+
+		const auto upper = m_map.upper_bound(addr);
+
+		if (upper == m_map.begin())
+		{
+			return {addr, nullptr};
+		}
+
+		const auto found = std::prev(upper);
+
+		// Exact address condition (size == 0)
+		if (size == 0 && found->first != addr)
+		{
+			return {addr, nullptr};
+		}
+
+		// Range check
+		if (std::max<u32>(size, addr - found->first + size) > found->second->size())
+		{
+			return {addr, nullptr};
+		}
+
+		return *found;
 	}
 
 	u32 block_t::imp_used(const vm::writer_lock&)
@@ -686,7 +699,7 @@ namespace vm
 
 		for (auto& entry : m_map)
 		{
-			result += entry.second;
+			result += entry.second->size();
 		}
 
 		return result;
@@ -694,14 +707,14 @@ namespace vm
 
 	u32 block_t::used()
 	{
-		writer_lock lock(0);
+		vm::writer_lock lock(0);
 
 		return imp_used(lock);
 	}
 
 	std::shared_ptr<block_t> map(u32 addr, u32 size, u64 flags)
 	{
-		writer_lock lock(0);
+		vm::writer_lock lock(0);
 
 		if (!size || (size | addr) % 4096)
 		{
@@ -738,7 +751,7 @@ namespace vm
 
 	std::shared_ptr<block_t> unmap(u32 addr, bool must_be_empty)
 	{
-		writer_lock lock(0);
+		vm::writer_lock lock(0);
 
 		for (auto it = g_locations.begin(); it != g_locations.end(); it++)
 		{
@@ -760,7 +773,7 @@ namespace vm
 
 	std::shared_ptr<block_t> get(memory_location_t location, u32 addr)
 	{
-		reader_lock lock;
+		vm::reader_lock lock;
 
 		if (location != any)
 		{
@@ -772,7 +785,7 @@ namespace vm
 
 			return nullptr;
 		}
-		
+
 		// search location by address
 		for (auto& block : g_locations)
 		{
@@ -785,7 +798,7 @@ namespace vm
 		return nullptr;
 	}
 
-	namespace ps3
+	inline namespace ps3_
 	{
 		void init()
 		{
@@ -796,39 +809,7 @@ namespace vm
 				std::make_shared<block_t>(0xC0000000, 0x10000000), // video
 				std::make_shared<block_t>(0xD0000000, 0x10000000), // stack
 				std::make_shared<block_t>(0xE0000000, 0x20000000), // SPU reserved
-				std::make_shared<block_t>(0x40000000, 0x10000000), // rsx contexts
 				std::make_shared<block_t>(0x30000000, 0x10000000), // main extend
-			};
-		}
-	}
-
-	namespace psv
-	{
-		void init()
-		{
-			g_locations = 
-			{
-				std::make_shared<block_t>(0x81000000, 0x10000000), // RAM
-				std::make_shared<block_t>(0x91000000, 0x2F000000), // user
-				std::make_shared<block_t>(0xC0000000, 0x10000000), // video (arbitrarily)
-				std::make_shared<block_t>(0xD0000000, 0x10000000), // stack (arbitrarily)
-			};
-		}
-	}
-
-	namespace psp
-	{
-		void init()
-		{
-			g_locations =
-			{
-				std::make_shared<block_t>(0x08000000, 0x02000000), // RAM
-				std::make_shared<block_t>(0x08800000, 0x01800000), // user
-				std::make_shared<block_t>(0x04000000, 0x00200000), // VRAM
-				nullptr, // stack
-
-				std::make_shared<block_t>(0x00010000, 0x00004000), // scratchpad
-				std::make_shared<block_t>(0x88000000, 0x00800000), // kernel
 			};
 		}
 	}
@@ -839,6 +820,8 @@ namespace vm
 
 		utils::memory_decommit(g_base_addr, 0x100000000);
 		utils::memory_decommit(g_exec_addr, 0x100000000);
+		utils::memory_decommit(g_stat_addr, 0x100000000);
+		utils::memory_decommit(g_reservations, 0x100000000);
 	}
 }
 

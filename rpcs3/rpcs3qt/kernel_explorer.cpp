@@ -28,11 +28,9 @@
 kernel_explorer::kernel_explorer(QWidget* parent) : QDialog(parent)
 {
 	setWindowTitle(tr("Kernel Explorer"));
+	setObjectName("kernel_explorer");
 	setAttribute(Qt::WA_DeleteOnClose);
 	setMinimumSize(QSize(700, 450));
-	QPalette pal;
-	pal.setColor(QPalette::Background, QColor(240, 240, 240));
-	setPalette(pal); //This fix the ugly background color under Windows
 
 	QVBoxLayout* vbox_panel = new QVBoxLayout();
 	QHBoxLayout* hbox_buttons = new QHBoxLayout();
@@ -56,7 +54,6 @@ kernel_explorer::kernel_explorer(QWidget* parent) : QDialog(parent)
 	// Events
 	connect(button_refresh, &QAbstractButton::clicked, this, &kernel_explorer::Update);
 
-	// Fill the wxTreeCtrl
 	Update();
 };
 

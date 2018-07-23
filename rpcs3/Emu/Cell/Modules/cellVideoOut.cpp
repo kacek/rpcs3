@@ -1,6 +1,8 @@
 #include "stdafx.h"
 #include "Emu/System.h"
 #include "Emu/Cell/PPUModule.h"
+#include "Emu/IdManager.h"
+#include "Emu/RSX/rsx_utils.h"
 
 #include "cellVideoOut.h"
 
@@ -145,6 +147,11 @@ error_code cellVideoOutConfigure(u32 videoOut, vm::ptr<CellVideoOutConfiguration
 		return CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION;
 	}
 
+	auto conf = fxm::get_always<rsx::avconf>();
+	conf->aspect = config->aspect;
+	conf->format = config->format;
+	conf->scanline_pitch = config->pitch;
+
 	return CELL_OK;
 }
 
@@ -256,7 +263,7 @@ s32 cellVideoOutUnregisterCallback(u32 slot)
 void cellSysutil_VideoOut_init()
 {
 	REG_FUNC(cellSysutil, cellVideoOutGetState);
-	REG_FUNC(cellSysutil, cellVideoOutGetResolution).flags = MFF_PERFECT;
+	REG_FUNC(cellSysutil, cellVideoOutGetResolution).flag(MFF_PERFECT);
 	REG_FUNC(cellSysutil, cellVideoOutConfigure);
 	REG_FUNC(cellSysutil, cellVideoOutGetConfiguration);
 	REG_FUNC(cellSysutil, cellVideoOutGetDeviceInfo);

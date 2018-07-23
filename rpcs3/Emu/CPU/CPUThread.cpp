@@ -4,6 +4,7 @@
 #include "CPUThread.h"
 #include "Emu/IdManager.h"
 #include "Utilities/GDBDebugServer.h"
+#include <typeinfo>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -100,7 +101,7 @@ bool cpu_thread::check_state()
 {
 #ifdef WITH_GDB_DEBUGGER
 	if (test(state, cpu_flag::dbg_pause)) {
-		fxm::get<GDBDebugServer>()->notify();
+		fxm::get<GDBDebugServer>()->pause_from(this);
 	}
 #endif
 
@@ -132,7 +133,11 @@ bool cpu_thread::check_state()
 
 		if (!test(state, cpu_state_pause))
 		{
-			if (cpu_flag_memory) vm::passive_lock(*this);
+			if (cpu_flag_memory)
+			{
+				cpu_mem();
+			}
+
 			break;
 		}
 		else if (!cpu_sleep_called && test(state, cpu_flag::suspend))

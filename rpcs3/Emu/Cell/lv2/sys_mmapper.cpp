@@ -1,9 +1,21 @@
 #include "stdafx.h"
+#include "Emu/Cell/PPUThread.h"
+#include "sys_ppu_thread.h"
+#include "Emu/Cell/lv2/sys_event.h"
+#include "Utilities/VirtualMemory.h"
+#include "sys_memory.h"
 #include "sys_mmapper.h"
 
-namespace vm { using namespace ps3; }
-
 logs::channel sys_mmapper("sys_mmapper");
+
+lv2_memory::lv2_memory(u32 size, u32 align, u64 flags, const std::shared_ptr<lv2_memory_container>& ct)
+	: size(size)
+	, align(align)
+	, flags(flags)
+	, ct(ct)
+	, shm(std::make_shared<utils::shm>(size))
+{
+}
 
 error_code sys_mmapper_allocate_address(u64 size, u64 flags, u64 alignment, vm::ptr<u32> alloc_addr)
 {
@@ -20,7 +32,7 @@ error_code sys_mmapper_allocate_address(u64 size, u64 flags, u64 alignment, vm::
 	}
 
 	// This is a workaround for psl1ght, which gives us an alignment of 0, which is technically invalid, but apparently is allowed on actual ps3
-	// https://github.com/ps3dev/PSL1GHT/blob/534e58950732c54dc6a553910b653c99ba6e9edc/ppu/librt/sbrk.c#L71 
+	// https://github.com/ps3dev/PSL1GHT/blob/534e58950732c54dc6a553910b653c99ba6e9edc/ppu/librt/sbrk.c#L71
 	if (!alignment)
 	{
 		alignment = 0x10000000;
@@ -33,7 +45,7 @@ error_code sys_mmapper_allocate_address(u64 size, u64 flags, u64 alignment, vm::
 	case 0x40000000:
 	case 0x80000000:
 	{
-		for (u64 addr = ::align<u64>(0x30000000, alignment); addr < 0xC0000000; addr += alignment)
+		for (u64 addr = ::align<u64>(0x40000000, alignment); addr < 0xC0000000; addr += alignment)
 		{
 			if (const auto area = vm::map(static_cast<u32>(addr), static_cast<u32>(size), flags))
 			{
@@ -57,7 +69,7 @@ error_code sys_mmapper_allocate_fixed_address()
 	{
 		return CELL_EEXIST;
 	}
-	
+
 	return CELL_OK;
 }
 
@@ -121,7 +133,7 @@ error_code sys_mmapper_allocate_shared_memory_from_container(u64 unk, u32 size, 
 		{
 			return CELL_EALIGN;
 		}
-		
+
 		break;
 	}
 
@@ -179,6 +191,19 @@ error_code sys_mmapper_free_address(u32 addr)
 {
 	sys_mmapper.error("sys_mmapper_free_address(addr=0x%x)", addr);
 
+	// If page fault notify exists and an address in this area is faulted, we can't free the memory.
+	auto pf_events = fxm::get_always<page_fault_event_entries>();
+	semaphore_lock pf_lock(pf_events->pf_mutex);
+
+	for (const auto& ev : pf_events->events)
+	{
+		auto mem = vm::get(vm::any, addr);
+		if (mem && addr <= ev.fault_addr && ev.fault_addr <= addr + mem->size - 1)
+		{
+			return CELL_EBUSY;
+		}
+	}
+
 	// Try to unmap area
 	const auto area = vm::unmap(addr, true);
 
@@ -192,6 +217,21 @@ error_code sys_mmapper_free_address(u32 addr)
 		return CELL_EBUSY;
 	}
 
+	// If a memory block is freed, remove it from page notification table.
+	auto pf_entries = fxm::get_always<page_fault_notification_entries>();
+	auto ind_to_remove = pf_entries->entries.begin();
+	for (; ind_to_remove != pf_entries->entries.end(); ++ind_to_remove)
+	{
+		if (addr == ind_to_remove->start_addr)
+		{
+			break;
+		}
+	}
+	if (ind_to_remove != pf_entries->entries.end())
+	{
+		pf_entries->entries.erase(ind_to_remove);
+	}
+
 	return CELL_OK;
 }
 
@@ -202,7 +242,7 @@ error_code sys_mmapper_free_shared_memory(u32 mem_id)
 	// Conditionally remove memory ID
 	const auto mem = idm::withdraw<lv2_obj, lv2_memory>(mem_id, [&](lv2_memory& mem) -> CellError
 	{
-		if (!mem.addr.compare_and_swap_test(0, -1))
+		if (mem.counter)
 		{
 			return CELL_EBUSY;
 		}
@@ -232,36 +272,45 @@ error_code sys_mmapper_map_shared_memory(u32 addr, u32 mem_id, u64 flags)
 
 	const auto area = vm::get(vm::any, addr);
 
-	if (!area || addr < 0x30000000 || addr >= 0xC0000000)
+	if (!area || addr < 0x40000000 || addr >= 0xC0000000)
 	{
 		return CELL_EINVAL;
 	}
 
-	const auto mem = idm::get<lv2_obj, lv2_memory>(mem_id);
+	const auto mem = idm::get<lv2_obj, lv2_memory>(mem_id, [&](lv2_memory& mem) -> CellError
+	{
+		const u32 page_alignment = area->flags & SYS_MEMORY_PAGE_SIZE_1M ? 0x100000 : 0x10000;
+
+		if (mem.align < page_alignment)
+		{
+			return CELL_EINVAL;
+		}
+
+		if (addr % page_alignment)
+		{
+			return CELL_EALIGN;
+		}
+
+		mem.counter++;
+		return {};
+	});
 
 	if (!mem)
 	{
 		return CELL_ESRCH;
 	}
 
-	if (addr % mem->align)
+	if (mem.ret)
 	{
-		return CELL_EALIGN;
+		return mem.ret;
 	}
 
-	if (const u32 old_addr = mem->addr.compare_and_swap(0, -1))
+	if (!area->falloc(addr, mem->size, &mem->shm))
 	{
-		sys_mmapper.warning("sys_mmapper_map_shared_memory(): Already mapped (mem_id=0x%x, addr=0x%x)", mem_id, old_addr);
-		return CELL_OK;
-	}
-
-	if (!area->falloc(addr, mem->size))
-	{
-		mem->addr = 0;
+		mem->counter--;
 		return CELL_EBUSY;
 	}
 
-	mem->addr = addr;
 	return CELL_OK;
 }
 
@@ -271,33 +320,30 @@ error_code sys_mmapper_search_and_map(u32 start_addr, u32 mem_id, u64 flags, vm:
 
 	const auto area = vm::get(vm::any, start_addr);
 
-	if (!area || start_addr < 0x30000000 || start_addr >= 0xC0000000)
+	if (!area || start_addr < 0x40000000 || start_addr >= 0xC0000000)
 	{
-		return CELL_EINVAL;
+		return {CELL_EINVAL, start_addr};
 	}
 
-	const auto mem = idm::get<lv2_obj, lv2_memory>(mem_id);
+	const auto mem = idm::get<lv2_obj, lv2_memory>(mem_id, [&](lv2_memory& mem)
+	{
+		mem.counter++;
+	});
 
 	if (!mem)
 	{
 		return CELL_ESRCH;
 	}
 
-	if (const u32 old_addr = mem->addr.compare_and_swap(0, -1))
-	{
-		sys_mmapper.warning("sys_mmapper_search_and_map(): Already mapped (mem_id=0x%x, addr=0x%x)", mem_id, old_addr);
-		return CELL_OK;
-	}
-
-	const u32 addr = area->alloc(mem->size, mem->align);
+	const u32 addr = area->alloc(mem->size, mem->align, &mem->shm);
 
 	if (!addr)
 	{
-		mem->addr = 0;
+		mem->counter--;
 		return CELL_ENOMEM;
 	}
 
-	*alloc_addr = mem->addr = addr;
+	*alloc_addr = addr;
 	return CELL_OK;
 }
 
@@ -307,34 +353,88 @@ error_code sys_mmapper_unmap_shared_memory(u32 addr, vm::ptr<u32> mem_id)
 
 	const auto area = vm::get(vm::any, addr);
 
-	if (!area || addr < 0x30000000 || addr >= 0xC0000000)
+	if (!area || addr < 0x40000000 || addr >= 0xC0000000)
 	{
-		return CELL_EINVAL;
+		return {CELL_EINVAL, addr};
 	}
 
-	const auto mem = idm::select<lv2_obj, lv2_memory>([&](u32 id, lv2_memory& mem)
+	const auto shm = area->get(addr);
+
+	if (!shm.second)
 	{
-		if (mem.addr == addr)
+		return {CELL_EINVAL, addr};
+	}
+
+	const auto mem = idm::select<lv2_obj, lv2_memory>([&](u32 id, lv2_memory& mem) -> u32
+	{
+		if (mem.shm.get() == shm.second.get())
 		{
-			*mem_id = id;
-			return true;
+			return id;
 		}
-		
-		return false;
+
+		return 0;
 	});
 
+	if (!mem)
+	{
+		return {CELL_EINVAL, addr};
+	}
+
+	if (!area->dealloc(addr, &shm.second))
+	{
+		return {CELL_EINVAL, addr};
+	}
+
+	// Write out the ID
+	*mem_id = mem.ret;
+
+	// Acknowledge
+	mem->counter--;
+
+	return CELL_OK;
+}
+
+error_code sys_mmapper_enable_page_fault_notification(u32 start_addr, u32 event_queue_id)
+{
+	sys_mmapper.warning("sys_mmapper_enable_page_fault_notification(start_addr=0x%x, event_queue_id=0x%x)", start_addr, event_queue_id);
+
+	auto mem = vm::get(vm::any, start_addr);
 	if (!mem)
 	{
 		return CELL_EINVAL;
 	}
 
-	verify(HERE), area->dealloc(addr), mem->addr.exchange(0) == addr;
-	return CELL_OK;
-}
+	// TODO: Check memory region's flags to make sure the memory can be used for page faults.
 
-error_code sys_mmapper_enable_page_fault_notification(u32 addr, u32 eq)
-{
-	sys_mmapper.todo("sys_mmapper_enable_page_fault_notification(addr=0x%x, eq=0x%x)", addr, eq);
+	auto queue = idm::get<lv2_obj, lv2_event_queue>(event_queue_id);
+
+	if (!queue)
+	{ // Can't connect the queue if it doesn't exist.
+		return CELL_ESRCH;
+	}
+
+	auto pf_entries = fxm::get_always<page_fault_notification_entries>();
+
+	// We're not allowed to have the same queue registered more than once for page faults.
+	for (const auto& entry : pf_entries->entries)
+	{
+		if (entry.event_queue_id == event_queue_id)
+		{
+			return CELL_ESRCH;
+		}
+	}
+
+	vm::ptr<u32> port_id = vm::make_var<u32>(0);
+	error_code res = sys_event_port_create(port_id, SYS_EVENT_PORT_LOCAL, SYS_MEMORY_PAGE_FAULT_EVENT_KEY);
+	sys_event_port_connect_local(port_id->value(), event_queue_id);
+
+	if (res == CELL_EAGAIN)
+	{ // Not enough system resources.
+		return CELL_EAGAIN;
+	}
+
+	page_fault_notification_entry entry{ start_addr, event_queue_id, port_id->value() };
+	pf_entries->entries.emplace_back(entry);
 
 	return CELL_OK;
 }

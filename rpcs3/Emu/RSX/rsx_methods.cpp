@@ -7,6 +7,7 @@
 #include "rsx_decode.h"
 #include "Emu/Cell/PPUCallback.h"
 #include "Emu/Cell/lv2/sys_rsx.h"
+#include "Capture/rsx_capture.h"
 
 #include <sstream>
 #include <cereal/archives/binary.hpp>
@@ -35,7 +36,7 @@ void fmt_class_string<frame_limit_type>::format(std::string& out, u64 arg)
 namespace rsx
 {
 	rsx_state method_registers;
-	
+
 	std::array<rsx_method_t, 0x10000 / 4> methods{};
 
 	void invalid_method(thread* rsx, u32 _reg, u32 arg)
@@ -50,35 +51,84 @@ namespace rsx
 	template<> struct vertex_data_type_from_element_type<float> { static const vertex_base_type type = vertex_base_type::f; };
 	template<> struct vertex_data_type_from_element_type<f16> { static const vertex_base_type type = vertex_base_type::sf; };
 	template<> struct vertex_data_type_from_element_type<u8> { static const vertex_base_type type = vertex_base_type::ub; };
-	template<> struct vertex_data_type_from_element_type<u16> { static const vertex_base_type type = vertex_base_type::s1; };
+	template<> struct vertex_data_type_from_element_type<u16> { static const vertex_base_type type = vertex_base_type::s32k; };
+	template<> struct vertex_data_type_from_element_type<s16> { static const vertex_base_type type = vertex_base_type::s1; };
 
 	namespace nv406e
 	{
 		void set_reference(thread* rsx, u32 _reg, u32 arg)
 		{
+			rsx->sync();
 			rsx->ctrl->ref.exchange(arg);
 		}
 
 		void semaphore_acquire(thread* rsx, u32 _reg, u32 arg)
 		{
+			rsx->sync_point_request = true;
 			const u32 addr = get_address(method_registers.semaphore_offset_406e(), method_registers.semaphore_context_dma_406e());
-			while (vm::ps3::read32(addr) != arg)
+			if (vm::read32(addr) == arg) return;
+
+			u64 start = get_system_time();
+			while (vm::read32(addr) != arg)
 			{
 				// todo: LLE: why does this one keep hanging? is it vsh system semaphore? whats actually pushing this to the command buffer?!
-				if (addr == 0x40000030)
-					break;
+				if (addr == get_current_renderer()->ctxt_addr + 0x30)
+					return;
 
 				if (Emu.IsStopped())
-					break;
+					return;
 
+				if (const auto tdr = (u64)g_cfg.video.driver_recovery_timeout)
+				{
+					if (Emu.IsPaused())
+					{
+						while (Emu.IsPaused())
+						{
+							std::this_thread::sleep_for(1ms);
+						}
+
+						// Reset
+						start = get_system_time();
+					}
+					else
+					{
+						if ((get_system_time() - start) > tdr)
+						{
+							// If longer than driver timeout force exit
+							LOG_ERROR(RSX, "nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
+							break;
+						}
+					}
+				}
+
+				rsx->on_semaphore_acquire_wait();
 				std::this_thread::yield();
 			}
+
+			rsx->performance_counters.idle_time += (get_system_time() - start);
 		}
 
 		void semaphore_release(thread* rsx, u32 _reg, u32 arg)
 		{
+			rsx->sync();
+			rsx->sync_point_request = true;
 			const u32 addr = get_address(method_registers.semaphore_offset_406e(), method_registers.semaphore_context_dma_406e());
-			vm::ps3::write32(addr, arg);
+
+			if (LIKELY(g_use_rtm))
+			{
+				vm::write32(addr, arg);
+			}
+			else
+			{
+				auto& res = vm::reservation_lock(addr, 4);
+				vm::write32(addr, arg);
+				res &= ~1ull;
+			}
+
+			if (addr >> 28 != 0x4)
+			{
+				vm::reservation_notifier(addr, 4).notify_all();
+			}
 		}
 	}
 
@@ -98,6 +148,16 @@ namespace rsx
 			}
 		}
 
+		void clear_zcull(thread* rsx, u32 _reg, u32 arg)
+		{
+			rsx->do_method(NV4097_CLEAR_ZCULL_SURFACE, arg);
+
+			if (rsx->capture_current_frame)
+			{
+				rsx->capture_frame("clear zcull memory");
+			}
+		}
+
 		void texture_read_semaphore_release(thread* rsx, u32 _reg, u32 arg)
 		{
 			const u32 index = method_registers.semaphore_offset_4097() >> 4;
@@ -108,7 +168,9 @@ namespace rsx
 			{
 				//
 			}
-			auto& sema = vm::ps3::_ref<RsxReports>(rsx->label_addr);
+
+			rsx->sync();
+			auto& sema = vm::_ref<RsxReports>(rsx->label_addr);
 			sema.semaphore[index].val = arg;
 			sema.semaphore[index].pad = 0;
 			sema.semaphore[index].timestamp = rsx->timestamp();
@@ -121,18 +183,25 @@ namespace rsx
 			{
 				//
 			}
-			u32 val = (arg & 0xff00ff00) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff);
 
-			auto& sema = vm::ps3::_ref<RsxReports>(rsx->label_addr);
+			rsx->sync();
+			u32 val = (arg & 0xff00ff00) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff);
+			auto& sema = vm::_ref<RsxReports>(rsx->label_addr);
 			sema.semaphore[index].val = val;
 			sema.semaphore[index].pad = 0;
 			sema.semaphore[index].timestamp = rsx->timestamp();
 		}
 
-		template<u32 id, u32 index, int count, typename type>
+		/**
+		 * id = base method register
+		 * index = register index in method
+		 * count = element count per attribute
+		 * register_count = number of registers consumed per attribute. E.g 3-element methods have padding
+		 */
+		template<u32 id, u32 index, int count, int register_count, typename type>
 		void set_vertex_data_impl(thread* rsx, u32 arg)
 		{
-			static const size_t increment_per_array_index = (count * sizeof(type)) / sizeof(u32);
+			static const size_t increment_per_array_index = (register_count * sizeof(type)) / sizeof(u32);
 
 			static const size_t attribute_index = index / increment_per_array_index;
 			static const size_t vertex_subreg = index % increment_per_array_index;
@@ -156,7 +225,7 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA4UB_M, index, 4, u8>(rsx, arg);
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA4UB_M, index, 4, 4, u8>(rsx, arg);
 			}
 		};
 
@@ -165,7 +234,7 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA1F_M, index, 1, f32>(rsx, arg);
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA1F_M, index, 1, 1, f32>(rsx, arg);
 			}
 		};
 
@@ -174,7 +243,7 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA2F_M, index, 2, f32>(rsx, arg);
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA2F_M, index, 2, 2, f32>(rsx, arg);
 			}
 		};
 
@@ -183,7 +252,8 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA3F_M, index, 3, f32>(rsx, arg);
+				//Register alignment is only 1, 2, or 4 (Rachet & Clank 2)
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA3F_M, index, 3, 4, f32>(rsx, arg);
 			}
 		};
 
@@ -192,7 +262,7 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA4F_M, index, 4, f32>(rsx, arg);
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA4F_M, index, 4, 4, f32>(rsx, arg);
 			}
 		};
 
@@ -201,7 +271,7 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA2S_M, index, 2, u16>(rsx, arg);
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA2S_M, index, 2, 2, u16>(rsx, arg);
 			}
 		};
 
@@ -210,7 +280,7 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA4S_M, index, 4, u16>(rsx, arg);
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA4S_M, index, 4, 4, u16>(rsx, arg);
 			}
 		};
 
@@ -219,8 +289,7 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				LOG_ERROR(RSX, "SCALED_4S vertex data format is not properly implemented");
-				set_vertex_data_impl<NV4097_SET_VERTEX_DATA4S_M, index, 4, u16>(rsx, arg);
+				set_vertex_data_impl<NV4097_SET_VERTEX_DATA_SCALED4S_M, index, 4, 4, s16>(rsx, arg);
 			}
 		};
 
@@ -271,9 +340,22 @@ namespace rsx
 				static constexpr u32 reg = index / 4;
 				static constexpr u8 subreg = index % 4;
 
-				u32 load = rsx::method_registers.transform_constant_load();
-				rsx::method_registers.transform_constants[load + reg].rgba[subreg] = (f32&)arg;
-				rsxthr->m_transform_constants_dirty = true;
+				const u32 load = rsx::method_registers.transform_constant_load();
+				const u32 address = load + reg;
+				if (address >= 468)
+				{
+					// Ignore addresses outside the usable [0, 467] range
+					LOG_ERROR(RSX, "Invalid transform register index (load=%d, index=%d)", load, index);
+					return;
+				}
+
+				auto &value = rsx::method_registers.transform_constants[load + reg][subreg];
+				if (value != arg)
+				{
+					//Transform constants invalidation is expensive (~8k bytes per update)
+					value = arg;
+					rsxthr->m_graphics_state |= rsx::pipeline_state::transform_constants_dirty;
+				}
 			}
 		};
 
@@ -283,16 +365,33 @@ namespace rsx
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
 				method_registers.commit_4_transform_program_instructions(index);
+				rsx->m_graphics_state |= rsx::pipeline_state::vertex_program_dirty;
 			}
 		};
+
+		void set_transform_program_start(thread* rsx, u32, u32)
+		{
+			if (method_registers.register_change_flag)
+			{
+				rsx->m_graphics_state |= rsx::pipeline_state::vertex_program_dirty;
+			}
+		}
+
+		void set_vertex_attribute_output_mask(thread* rsx, u32, u32)
+		{
+			if (method_registers.register_change_flag)
+			{
+				rsx->m_graphics_state |= rsx::pipeline_state::vertex_program_dirty | rsx::pipeline_state::fragment_program_dirty;
+			}
+		}
 
 		void set_begin_end(thread* rsxthr, u32 _reg, u32 arg)
 		{
 			if (arg)
 			{
-				rsx::method_registers.current_draw_clause.first_count_commands.clear();
+				rsx::method_registers.current_draw_clause.first_count_commands.resize(0);
 				rsx::method_registers.current_draw_clause.command = draw_command::none;
-				rsx::method_registers.current_draw_clause.primitive = rsx::method_registers.primitive_mode();
+				rsx::method_registers.current_draw_clause.primitive = to_primitive_type(arg);
 				rsxthr->begin();
 				return;
 			}
@@ -356,7 +455,7 @@ namespace rsx
 				return;
 			}
 
-			vm::ps3::ptr<CellGcmReportData> result = address_ptr;
+			vm::ptr<CellGcmReportData> result = address_ptr;
 
 			switch (type)
 			{
@@ -365,16 +464,14 @@ namespace rsx
 			case CELL_GCM_ZCULL_STATS1:
 			case CELL_GCM_ZCULL_STATS2:
 			case CELL_GCM_ZCULL_STATS3:
-				result->value = rsx->get_zcull_stats(type);
-				LOG_WARNING(RSX, "NV4097_GET_REPORT: Unimplemented type %d", type);
+				rsx->get_zcull_stats(type, address_ptr);
 				break;
 			default:
 				LOG_ERROR(RSX, "NV4097_GET_REPORT: Bad type %d", type);
+				result->timer = rsx->timestamp();
+				result->padding = 0;
 				break;
 			}
-
-			result->timer = rsx->timestamp();
-			result->padding = 0;
 		}
 
 		void clear_report_value(thread* rsx, u32 _reg, u32 arg)
@@ -382,10 +479,7 @@ namespace rsx
 			switch (arg)
 			{
 			case CELL_GCM_ZPASS_PIXEL_CNT:
-				LOG_WARNING(RSX, "TODO: NV4097_CLEAR_REPORT_VALUE: ZPASS_PIXEL_CNT");
-				break;
 			case CELL_GCM_ZCULL_STATS:
-				LOG_WARNING(RSX, "TODO: NV4097_CLEAR_REPORT_VALUE: ZCULL_STATS");
 				break;
 			default:
 				LOG_ERROR(RSX, "NV4097_CLEAR_REPORT_VALUE: Bad type: %d", arg);
@@ -424,7 +518,8 @@ namespace rsx
 				return;
 			}
 
-			vm::ps3::ptr<CellGcmReportData> result = address_ptr;
+			rsx->sync();
+			vm::ptr<CellGcmReportData> result = address_ptr;
 			rsx->conditional_render_test_failed = (result->value == 0);
 		}
 
@@ -446,9 +541,26 @@ namespace rsx
 			rsx->notify_zcull_info_changed();
 		}
 
-		void set_surface_dirty_bit(thread* rsx, u32 _reg, u32)
+		void sync(thread* rsx, u32, u32)
+		{
+			rsx->sync();
+		}
+
+		void set_shader_program_dirty(thread* rsx, u32, u32)
+		{
+			rsx->m_graphics_state |= rsx::pipeline_state::fragment_program_dirty;
+		}
+
+		void set_surface_dirty_bit(thread* rsx, u32, u32)
 		{
 			rsx->m_rtts_dirty = true;
+			rsx->m_framebuffer_state_contested = false;
+		}
+
+		void set_surface_options_dirty_bit(thread* rsx, u32, u32)
+		{
+			if (rsx->m_framebuffer_state_contested)
+				rsx->m_rtts_dirty = true;
 		}
 
 		template<u32 index>
@@ -457,6 +569,25 @@ namespace rsx
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
 				rsx->m_textures_dirty[index] = true;
+
+				if (rsx->current_fp_metadata.referenced_textures_mask & (1 << index))
+				{
+					rsx->m_graphics_state |= rsx::pipeline_state::fragment_program_dirty;
+				}
+			}
+		};
+
+		template<u32 index>
+		struct set_vertex_texture_dirty_bit
+		{
+			static void impl(thread* rsx, u32 _reg, u32 arg)
+			{
+				rsx->m_vertex_textures_dirty[index] = true;
+
+				if (rsx->current_vp_metadata.referenced_textures_mask & (1 << index))
+				{
+					rsx->m_graphics_state |= rsx::pipeline_state::vertex_program_dirty;
+				}
 			}
 		};
 	}
@@ -468,16 +599,60 @@ namespace rsx
 		{
 			static void impl(thread* rsx, u32 _reg, u32 arg)
 			{
-				u16 x = method_registers.nv308a_x();
-				u16 y = method_registers.nv308a_y();
-
-				if (y)
+				if (index >= method_registers.nv308a_size_out_x())
 				{
-					LOG_ERROR(RSX, "%s: y is not null (0x%x)", __FUNCTION__, y);
+					// Skip
+					return;
 				}
 
-				u32 address = get_address(method_registers.blit_engine_output_offset_nv3062() + (x << 2) + index * 4, method_registers.blit_engine_output_location_nv3062());
-				vm::ps3::write32(address, arg);
+				u32 color = arg;
+				u32 write_len = 4;
+				switch (method_registers.blit_engine_nv3062_color_format())
+				{
+				case blit_engine::transfer_destination_format::a8r8g8b8:
+				case blit_engine::transfer_destination_format::y32:
+				{
+					// Bit cast
+					break;
+				}
+				case blit_engine::transfer_destination_format::r5g6b5:
+				{
+					// Input is considered to be ARGB8
+					u32 r = (arg >> 16) & 0xFF;
+					u32 g = (arg >> 8) & 0xFF;
+					u32 b = arg & 0xFF;
+
+					r = u32(r * 32 / 255.f);
+					g = u32(g * 64 / 255.f);
+					b = u32(b * 32 / 255.f);
+					color = (r << 11) | (g << 5) | b;
+					write_len = 2;
+					break;
+				}
+				default:
+				{
+					fmt::throw_exception("Unreachable" HERE);
+				}
+				}
+
+				const u16 x = method_registers.nv308a_x();
+				const u16 y = method_registers.nv308a_y();
+				const u32 pixel_offset = (method_registers.blit_engine_output_pitch_nv3062() * y) + (x * write_len);
+				u32 address = get_address(method_registers.blit_engine_output_offset_nv3062() + pixel_offset + (index * write_len), method_registers.blit_engine_output_location_nv3062());
+
+				switch (write_len)
+				{
+				case 4:
+					vm::write32(address, color);
+					break;
+				case 2:
+					vm::write16(address, (u16)(color));
+					break;
+				default:
+					fmt::throw_exception("Unreachable" HERE);
+				}
+
+				rsx->m_graphics_state |= rsx::pipeline_state::fragment_program_dirty;
 			}
 		};
 	}
@@ -500,8 +675,8 @@ namespace rsx
 			const blit_engine::transfer_interpolator in_inter = method_registers.blit_engine_input_inter();
 			const rsx::blit_engine::transfer_source_format src_color_format = method_registers.blit_engine_src_color_format();
 
-			const f32 in_x = method_registers.blit_engine_in_x();
-			const f32 in_y = method_registers.blit_engine_in_y();
+			const f32 in_x = std::ceil(method_registers.blit_engine_in_x());
+			const f32 in_y = std::ceil(method_registers.blit_engine_in_y());
 
 			//Clipping
 			//Validate that clipping rect will fit onto both src and dst regions
@@ -529,10 +704,16 @@ namespace rsx
 
 			u16 in_pitch = method_registers.blit_engine_input_pitch();
 
+			if (in_w == 0 || in_h == 0 || out_w == 0 || out_h == 0)
+			{
+				LOG_ERROR(RSX, "NV3089_IMAGE_IN_SIZE: Invalid blit dimensions passed");
+				return;
+			}
+
 			if (in_origin != blit_engine::transfer_origin::corner)
 			{
-				LOG_ERROR(RSX, "NV3089_IMAGE_IN_SIZE: unknown origin (%d)", (u8)in_origin);
-				return;
+				// Probably refers to texel geometry which would affect clipping algorithm slightly when rounding texel addresses
+				LOG_WARNING(RSX, "NV3089_IMAGE_IN_SIZE: unknown origin (%d)", (u8)in_origin);
 			}
 
 			if (operation != rsx::blit_engine::transfer_operation::srccopy)
@@ -547,7 +728,7 @@ namespace rsx
 			u32 dst_dma = 0;
 			rsx::blit_engine::transfer_destination_format dst_color_format;
 			u32 out_pitch = 0;
-			u32 out_aligment = 64;
+			u32 out_alignment = 64;
 
 			switch (method_registers.blit_engine_context_surface())
 			{
@@ -556,7 +737,7 @@ namespace rsx
 				dst_offset = method_registers.blit_engine_output_offset_nv3062();
 				dst_color_format = method_registers.blit_engine_nv3062_color_format();
 				out_pitch = method_registers.blit_engine_output_pitch_nv3062();
-				out_aligment = method_registers.blit_engine_output_alignment_nv3062();
+				out_alignment = method_registers.blit_engine_output_alignment_nv3062();
 				break;
 
 			case blit_engine::context_surface::swizzle2d:
@@ -570,47 +751,8 @@ namespace rsx
 				return;
 			}
 
-			if (dst_dma == CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER)
-			{
-				//HACK: it's extension of the flip-hack. remove this when textures cache would be properly implemented
-				for (int i = 0; i < rsx::limits::color_buffers_count; ++i)
-				{
-					u32 begin = rsx->display_buffers[i].offset;
-
-					if (dst_offset < begin || !begin)
-					{
-						continue;
-					}
-
-					if (rsx->display_buffers[i].width < 720 || rsx->display_buffers[i].height < 480)
-					{
-						continue;
-					}
-
-					if (begin == dst_offset)
-					{
-						return;
-					}
-
-					u32 end = begin + rsx->display_buffers[i].height * rsx->display_buffers[i].pitch;
-
-					if (dst_offset < end)
-					{
-						return;
-					}
-				}
-			}
-
 			const u32 in_bpp = (src_color_format == rsx::blit_engine::transfer_source_format::r5g6b5) ? 2 : 4; // bytes per pixel
 			const u32 out_bpp = (dst_color_format == rsx::blit_engine::transfer_destination_format::r5g6b5) ? 2 : 4;
-
-			const u32 in_offset = u32(in_x * in_bpp + in_pitch * in_y);
-			const s32 out_offset = out_x * out_bpp + out_pitch * out_y;
-
-			const tiled_region src_region = rsx->get_tiled_address(src_offset + in_offset, src_dma & 0xf);
-
-			u8* pixels_src = src_region.tile ? src_region.ptr + src_region.base : src_region.ptr;
-			u8* pixels_dst = vm::ps3::_ptr<u8>(get_address(dst_offset + out_offset, dst_dma));
 
 			if (out_pitch == 0)
 			{
@@ -621,6 +763,18 @@ namespace rsx
 			{
 				in_pitch = in_bpp * in_w;
 			}
+
+			const u32 in_offset = u32(in_x * in_bpp + in_pitch * in_y);
+			const s32 out_offset = out_x * out_bpp + out_pitch * out_y;
+
+			const tiled_region src_region = rsx->get_tiled_address(src_offset + in_offset, src_dma & 0xf);
+			const tiled_region dst_region = rsx->get_tiled_address(dst_offset + out_offset, dst_dma & 0xf);
+
+			u8* pixels_src = src_region.tile ? src_region.ptr + src_region.base : src_region.ptr;
+			u8* pixels_dst = vm::_ptr<u8>(get_address(dst_offset + out_offset, dst_dma));
+
+			const auto read_address = get_address(src_offset, src_dma);
+			rsx->read_barrier(read_address, in_pitch * in_h);
 
 			if (dst_color_format != rsx::blit_engine::transfer_destination_format::r5g6b5 &&
 				dst_color_format != rsx::blit_engine::transfer_destination_format::a8r8g8b8)
@@ -634,32 +788,33 @@ namespace rsx
 				LOG_ERROR(RSX, "NV3089_IMAGE_IN_SIZE: unknown src_color_format (%d)", (u8)src_color_format);
 			}
 
-			std::unique_ptr<u8[]> temp1, temp2, sw_temp;
-
-			AVPixelFormat in_format = (src_color_format == rsx::blit_engine::transfer_source_format::r5g6b5) ? AV_PIX_FMT_RGB565BE : AV_PIX_FMT_ARGB;
-			AVPixelFormat out_format = (dst_color_format == rsx::blit_engine::transfer_destination_format::r5g6b5) ? AV_PIX_FMT_RGB565BE : AV_PIX_FMT_ARGB;
-
 			f32 scale_x = 1048576.f / method_registers.blit_engine_ds_dx();
 			f32 scale_y = 1048576.f / method_registers.blit_engine_dt_dy();
 
 			u32 convert_w = (u32)(scale_x * in_w);
 			u32 convert_h = (u32)(scale_y * in_h);
 
-			bool need_clip =
-				clip_w != in_w ||
-				clip_h != in_h ||
-				clip_x > 0 || clip_y > 0 ||
-				convert_w != out_w || convert_h != out_h;
-
-			bool need_convert = out_format != in_format || scale_x != 1.0 || scale_y != 1.0;
+			if (convert_w == 0 || convert_h == 0)
+			{
+				LOG_ERROR(RSX, "NV3089_IMAGE_IN: Invalid dimensions or scaling factor. Request ignored (ds_dx=%d, dt_dy=%d)",
+					method_registers.blit_engine_ds_dx(), method_registers.blit_engine_dt_dy());
+				return;
+			}
 
 			u32 slice_h = clip_h;
+			blit_src_info src_info = {};
+			blit_dst_info dst_info = {};
 
 			if (src_region.tile)
 			{
-				if (src_region.tile->comp == CELL_GCM_COMPMODE_C32_2X2)
+				switch(src_region.tile->comp)
 				{
+				case CELL_GCM_COMPMODE_C32_2X2:
 					slice_h *= 2;
+					src_info.compressed_y = true;
+				case CELL_GCM_COMPMODE_C32_2X1:
+					src_info.compressed_x = true;
+					break;
 				}
 
 				u32 size = slice_h * in_pitch;
@@ -671,15 +826,27 @@ namespace rsx
 				}
 			}
 
-			if (g_cfg.video.use_gpu_texture_scaling && dst_dma == CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER)
+			if (dst_region.tile)
+			{
+				switch (dst_region.tile->comp)
+				{
+				case CELL_GCM_COMPMODE_C32_2X2:
+					dst_info.compressed_y = true;
+				case CELL_GCM_COMPMODE_C32_2X1:
+					dst_info.compressed_x = true;
+					break;
+				}
+
+				dst_info.max_tile_h = static_cast<u16>((dst_region.tile->size - dst_region.base) / out_pitch);
+			}
+
+			if (!g_cfg.video.force_cpu_blit_processing && (dst_dma == CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER || src_dma == CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER))
 			{
 				//For now, only use this for actual scaled images, there are use cases that should not go through 3d engine, e.g program ucode transfer
 				//TODO: Figure out more instances where we can use this without problems
-
-				blit_src_info src_info;
-				blit_dst_info dst_info;
-
+				//NOTE: In cases where slice_h is modified due to compression (read from tiled memory), the new value (clip_h * 2) does not matter if memory is on the GPU
 				src_info.format = src_color_format;
+				src_info.origin = in_origin;
 				src_info.width = in_w;
 				src_info.height = in_h;
 				src_info.pitch = in_pitch;
@@ -699,6 +866,8 @@ namespace rsx
 				dst_info.offset_x = out_x;
 				dst_info.offset_y = out_y;
 				dst_info.pitch = out_pitch;
+				dst_info.scale_x = scale_x;
+				dst_info.scale_y = scale_y;
 				dst_info.pixels = pixels_dst;
 				dst_info.rsx_address = get_address(dst_offset, dst_dma);
 				dst_info.swizzled = (method_registers.blit_engine_context_surface() == blit_engine::context_surface::swizzle2d);
@@ -707,10 +876,23 @@ namespace rsx
 					return;
 			}
 
+			std::unique_ptr<u8[]> temp1, temp2, sw_temp;
+
+			const AVPixelFormat in_format = (src_color_format == rsx::blit_engine::transfer_source_format::r5g6b5) ? AV_PIX_FMT_RGB565BE : AV_PIX_FMT_ARGB;
+			const AVPixelFormat out_format = (dst_color_format == rsx::blit_engine::transfer_destination_format::r5g6b5) ? AV_PIX_FMT_RGB565BE : AV_PIX_FMT_ARGB;
+
+			const bool need_clip =
+				clip_w != in_w ||
+				clip_h != in_h ||
+				clip_x > 0 || clip_y > 0 ||
+				convert_w != out_w || convert_h != out_h;
+
+			const bool need_convert = out_format != in_format || scale_x != 1.0 || scale_y != 1.0;
+
 			if (method_registers.blit_engine_context_surface() != blit_engine::context_surface::swizzle2d)
 			{
 				if (need_convert || need_clip)
-				{					
+				{
 					if (need_clip)
 					{
 						if (need_convert)
@@ -776,7 +958,9 @@ namespace rsx
 					pixels_src = temp2.get();
 				}
 
-				u8 sw_width_log2 = method_registers.nv309e_sw_width_log2();
+				// It looks like rsx may ignore the requested swizzle size and just always
+				// round up to nearest power of 2
+				/*u8 sw_width_log2 = method_registers.nv309e_sw_width_log2();
 				u8 sw_height_log2 = method_registers.nv309e_sw_height_log2();
 
 				// 0 indicates height of 1 pixel
@@ -785,13 +969,17 @@ namespace rsx
 				// swizzle based on destination size
 				u16 sw_width = 1 << sw_width_log2;
 				u16 sw_height = 1 << sw_height_log2;
+				*/
+
+				u32 sw_width = next_pow2(out_w);
+				u32 sw_height = next_pow2(out_h);
 
 				temp2.reset(new u8[out_bpp * sw_width * sw_height]);
 
 				u8* linear_pixels = pixels_src;
 				u8* swizzled_pixels = temp2.get();
 
-				// Check and pad texture out if we are given non square texture for swizzle to be correct
+				// Check and pad texture out if we are given non power of 2 output
 				if (sw_width != out_w || sw_height != out_h)
 				{
 					sw_temp.reset(new u8[out_bpp * sw_width * sw_height]);
@@ -815,13 +1003,13 @@ namespace rsx
 				switch (out_bpp)
 				{
 				case 1:
-					convert_linear_swizzle<u8>(linear_pixels, swizzled_pixels, sw_width, sw_height, false);
+					convert_linear_swizzle<u8>(linear_pixels, swizzled_pixels, sw_width, sw_height, in_pitch, false);
 					break;
 				case 2:
-					convert_linear_swizzle<u16>(linear_pixels, swizzled_pixels, sw_width, sw_height, false);
+					convert_linear_swizzle<u16>(linear_pixels, swizzled_pixels, sw_width, sw_height, in_pitch, false);
 					break;
 				case 4:
-					convert_linear_swizzle<u32>(linear_pixels, swizzled_pixels, sw_width, sw_height, false);
+					convert_linear_swizzle<u32>(linear_pixels, swizzled_pixels, sw_width, sw_height, in_pitch, false);
 					break;
 				}
 
@@ -832,7 +1020,7 @@ namespace rsx
 
 	namespace nv0039
 	{
-		void buffer_notify(thread*, u32, u32 arg)
+		void buffer_notify(thread *rsx, u32, u32 arg)
 		{
 			s32 in_pitch = method_registers.nv0039_input_pitch();
 			s32 out_pitch = method_registers.nv0039_output_pitch();
@@ -848,7 +1036,7 @@ namespace rsx
 				LOG_ERROR(RSX, "NV0039_OFFSET_IN: Unsupported format: inFormat=%d, outFormat=%d", in_format, out_format);
 			}
 
-			LOG_NOTICE(RSX, "NV0039_OFFSET_IN: pitch(in=0x%x, out=0x%x), line(len=0x%x, cnt=0x%x), fmt(in=0x%x, out=0x%x), notify=0x%x",
+			LOG_TRACE(RSX, "NV0039_OFFSET_IN: pitch(in=0x%x, out=0x%x), line(len=0x%x, cnt=0x%x), fmt(in=0x%x, out=0x%x), notify=0x%x",
 				in_pitch, out_pitch, line_length, line_count, in_format, out_format, notify);
 
 			if (!in_pitch)
@@ -867,8 +1055,11 @@ namespace rsx
 			u32 dst_offset = method_registers.nv0039_output_offset();
 			u32 dst_dma = method_registers.nv0039_output_location();
 
+			const auto read_address = get_address(src_offset, src_dma);
+			rsx->read_barrier(read_address, in_pitch * line_count);
+
 			u8 *dst = (u8*)vm::base(get_address(dst_offset, dst_dma));
-			const u8 *src = (u8*)vm::base(get_address(src_offset, src_dma));
+			const u8 *src = (u8*)vm::base(read_address);
 
 			if (in_pitch == out_pitch && out_pitch == line_length)
 			{
@@ -888,22 +1079,44 @@ namespace rsx
 
 	void flip_command(thread* rsx, u32, u32 arg)
 	{
-		if (user_asked_for_frame_capture)
+		if (user_asked_for_frame_capture && !g_cfg.video.strict_rendering_mode)
+		{
+			// not dealing with non-strict rendering capture for now
+			user_asked_for_frame_capture = false;
+			LOG_FATAL(RSX, "RSX Capture: Capture only supported when ran with strict rendering mode.");
+		}
+		else if (user_asked_for_frame_capture && !rsx->capture_current_frame)
 		{
 			rsx->capture_current_frame = true;
 			user_asked_for_frame_capture = false;
 			frame_debug.reset();
+			frame_capture.reset();
+
+			// random number just to jumpstart the size
+			frame_capture.replay_commands.reserve(8000);
+
+			// capture first tile state with nop cmd
+			rsx::frame_capture_data::replay_command replay_cmd;
+			replay_cmd.rsx_command = std::make_pair(NV4097_NO_OPERATION, 0);
+			frame_capture.replay_commands.push_back(replay_cmd);
+			capture::capture_display_tile_state(rsx, frame_capture.replay_commands.back());
 		}
 		else if (rsx->capture_current_frame)
 		{
 			rsx->capture_current_frame = false;
 			std::stringstream os;
 			cereal::BinaryOutputArchive archive(os);
-			archive(frame_debug);
+			const std::string& filePath = fs::get_config_dir() + "capture.rrc";
+			archive(frame_capture);
 			{
-				fs::file f(fs::get_config_dir() + "capture.txt", fs::rewrite);
+				// todo: 'dynamicly' create capture filename, also may want to compress this data?
+				fs::file f(filePath, fs::rewrite);
 				f.write(os.str());
 			}
+
+			LOG_SUCCESS(RSX, "capture successful: %s", filePath.c_str());
+
+			frame_capture.reset();
 			Emu.Pause();
 		}
 
@@ -917,12 +1130,35 @@ namespace rsx
 		case frame_limit_type::_30: limit = 30.; break;
 		case frame_limit_type::_auto: limit = rsx->fps_limit; break; // TODO
 		}
+
 		if (limit)
 		{
-			std::this_thread::sleep_for(std::chrono::milliseconds((s64)(1000.0 / limit - rsx->timer_sync.GetElapsedTimeInMilliSec())));
-			rsx->timer_sync.Start();
+			const u64 time = get_system_time() - Emu.GetPauseTime() - rsx->start_rsx_time;
+
+			if (rsx->int_flip_index == 0)
+			{
+				rsx->start_rsx_time = time;
+			}
+			else
+			{
+				// Convert limit to expected time value
+				double expected = rsx->int_flip_index * 1000000. / limit;
+
+				while (time >= expected + 1000000. / limit)
+				{
+					expected = rsx->int_flip_index++ * 1000000. / limit;
+				}
+
+				if (expected > time + 1000)
+				{
+					const auto delay_us = static_cast<s64>(expected - time);
+					std::this_thread::sleep_for(std::chrono::milliseconds{delay_us / 1000});
+					rsx->performance_counters.idle_time += delay_us;
+				}
+			}
 		}
-		
+
+		rsx->int_flip_index++;
 		rsx->current_display_buffer = arg;
 		rsx->flip(arg);
 		// After each flip PS3 system is executing a routine that changes registers value to some default.
@@ -964,7 +1200,7 @@ namespace rsx
 
 	namespace gcm
 	{
-		// not entirely sure which one should actually do the flip, or if these should be handled seperately,
+		// not entirely sure which one should actually do the flip, or if these should be handled separately,
 		// so for now lets flip in queue and just let the driver deal with it
 		template<u32 index>
 		struct driver_flip
@@ -1053,6 +1289,7 @@ namespace rsx
 
 		// Stencil bits init to 00 - Tested with NPEB90184 (never sets the depth_stencil clear values but uses stencil test)
 		registers[NV4097_SET_ZSTENCIL_CLEAR_VALUE] = 0xffffff00;
+		registers[NV4097_SET_ZMIN_MAX_CONTROL] = 1;
 
 		// CELL_GCM_SURFACE_A8R8G8B8, CELL_GCM_SURFACE_Z24S8 and CELL_GCM_SURFACE_CENTER_1
 		registers[NV4097_SET_SURFACE_FORMAT] = (8 << 0) | (2 << 5) | (0 << 12) | (1 << 16) | (1 << 24);
@@ -1079,7 +1316,21 @@ namespace rsx
 
 	void rsx_state::decode(u32 reg, u32 value)
 	{
-		registers[reg] = value;
+		auto& old_value = registers[reg];
+		if (old_value != value)
+		{
+			register_change_flag = true;
+			old_value = value;
+		}
+		else
+		{
+			register_change_flag = false;
+		}
+	}
+
+	bool rsx_state::test(u32 reg, u32 value) const
+	{
+		return registers[reg] == value;
 	}
 
 	namespace method_detail
@@ -1454,7 +1705,7 @@ namespace rsx
 
 		//Some custom GCM methods
 		methods[GCM_SET_DRIVER_OBJECT]                    = nullptr;
-		
+
 		bind_array<GCM_FLIP_HEAD, 1, 2, nullptr>();
 		bind_array<GCM_DRIVER_QUEUE, 1, 8, nullptr>();
 
@@ -1467,7 +1718,7 @@ namespace rsx
 		bind_array<NV4097_SET_TEX_COORD_CONTROL, 1, 10, nullptr>();
 		bind_array<NV4097_SET_TRANSFORM_PROGRAM, 1, 32, nullptr>();
 		bind_array<NV4097_SET_POLYGON_STIPPLE_PATTERN, 1, 32, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA3F_M, 1, 48, nullptr>();
+		bind_array<NV4097_SET_VERTEX_DATA3F_M, 1, 64, nullptr>();
 		bind_array<NV4097_SET_VERTEX_DATA_ARRAY_OFFSET, 1, 16, nullptr>();
 		bind_array<NV4097_SET_VERTEX_DATA_ARRAY_FORMAT, 1, 16, nullptr>();
 		bind_array<NV4097_SET_TEXTURE_CONTROL3, 1, 16, nullptr>();
@@ -1479,6 +1730,7 @@ namespace rsx
 		bind_array<NV4097_SET_VERTEX_DATA4F_M, 1, 64, nullptr>();
 		bind_array<NV4097_SET_VERTEX_DATA1F_M, 1, 16, nullptr>();
 		bind_array<NV4097_SET_COLOR_KEY_COLOR, 1, 16, nullptr>();
+		bind_array<(0xac00 >> 2), 1, 16, nullptr>();  // Unknown texture control register
 
 		// NV406E
 		bind<NV406E_SET_REFERENCE, nv406e::set_reference>();
@@ -1499,7 +1751,7 @@ namespace rsx
 		bind_range<NV4097_SET_VERTEX_DATA4UB_M, 1, 16, nv4097::set_vertex_data4ub_m>();
 		bind_range<NV4097_SET_VERTEX_DATA1F_M, 1, 16, nv4097::set_vertex_data1f_m>();
 		bind_range<NV4097_SET_VERTEX_DATA2F_M, 1, 32, nv4097::set_vertex_data2f_m>();
-		bind_range<NV4097_SET_VERTEX_DATA3F_M, 1, 48, nv4097::set_vertex_data3f_m>();
+		bind_range<NV4097_SET_VERTEX_DATA3F_M, 1, 64, nv4097::set_vertex_data3f_m>();
 		bind_range<NV4097_SET_VERTEX_DATA4F_M, 1, 64, nv4097::set_vertex_data4f_m>();
 		bind_range<NV4097_SET_VERTEX_DATA2S_M, 1, 16, nv4097::set_vertex_data2s_m>();
 		bind_range<NV4097_SET_VERTEX_DATA4S_M, 1, 32, nv4097::set_vertex_data4s_m>();
@@ -1520,20 +1772,46 @@ namespace rsx
 		bind<NV4097_SET_CONTEXT_DMA_COLOR_D, nv4097::set_surface_dirty_bit>();
 		bind<NV4097_SET_CONTEXT_DMA_ZETA, nv4097::set_surface_dirty_bit>();
 		bind<NV4097_SET_SURFACE_FORMAT, nv4097::set_surface_dirty_bit>();
+		bind<NV4097_SET_SURFACE_PITCH_A, nv4097::set_surface_dirty_bit>();
+		bind<NV4097_SET_SURFACE_PITCH_B, nv4097::set_surface_dirty_bit>();
+		bind<NV4097_SET_SURFACE_PITCH_C, nv4097::set_surface_dirty_bit>();
+		bind<NV4097_SET_SURFACE_PITCH_D, nv4097::set_surface_dirty_bit>();
+		bind<NV4097_SET_SURFACE_PITCH_Z, nv4097::set_surface_dirty_bit>();
+		bind<NV4097_SET_WINDOW_OFFSET, nv4097::set_surface_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_OFFSET, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_FORMAT, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_ADDRESS, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_CONTROL0, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_CONTROL1, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_CONTROL2, 8, 16, nv4097::set_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_CONTROL2, 1, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_CONTROL3, 1, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_FILTER, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_IMAGE_RECT, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_BORDER_COLOR, 8, 16, nv4097::set_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_OFFSET, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_FORMAT, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_ADDRESS, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_CONTROL0, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_CONTROL3, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_FILTER, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_IMAGE_RECT, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
+		bind_range<NV4097_SET_VERTEX_TEXTURE_BORDER_COLOR, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
 		bind<NV4097_SET_RENDER_ENABLE, nv4097::set_render_mode>();
 		bind<NV4097_SET_ZCULL_EN, nv4097::set_zcull_render_enable>();
 		bind<NV4097_SET_ZCULL_STATS_ENABLE, nv4097::set_zcull_stats_enable>();
 		bind<NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, nv4097::set_zcull_pixel_count_enable>();
+		bind<NV4097_CLEAR_ZCULL_SURFACE, nv4097::clear_zcull>();
+		bind<NV4097_SET_DEPTH_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_DEPTH_MASK, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_COLOR_MASK, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_WAIT_FOR_IDLE, nv4097::sync>();
+		bind<NV4097_ZCULL_SYNC, nv4097::sync>();
+		bind<NV4097_SET_CONTEXT_DMA_REPORT, nv4097::sync>();
+		bind<NV4097_INVALIDATE_L2, nv4097::set_shader_program_dirty>();
+		bind<NV4097_SET_SHADER_PROGRAM, nv4097::set_shader_program_dirty>();
+		bind<NV4097_SET_TRANSFORM_PROGRAM_START, nv4097::set_transform_program_start>();
+		bind<NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, nv4097::set_vertex_attribute_output_mask>();
 
 		//NV308A
 		bind_range<NV308A_COLOR, 1, 256, nv308a::color>();
@@ -1552,8 +1830,8 @@ namespace rsx
 
 		// custom methods
 		bind<GCM_FLIP_COMMAND, flip_command>();
-		
 
-		return true;	
+
+		return true;
 	}();
 }

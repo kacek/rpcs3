@@ -32,7 +32,6 @@
 #define SAFE_BUFFERS
 #define NEVER_INLINE __attribute__((noinline))
 #define FORCE_INLINE __attribute__((always_inline)) inline
-#define thread_local __thread
 #endif
 
 #define CHECK_SIZE(type, size) static_assert(sizeof(type) == size, "Invalid " #type " type size")
@@ -49,7 +48,7 @@
 #define CONCATENATE_DETAIL(x, y) x ## y
 #define CONCATENATE(x, y) CONCATENATE_DETAIL(x, y)
 
-#define STRINGIZE_DETAIL(x) #x
+#define STRINGIZE_DETAIL(x) #x ""
 #define STRINGIZE(x) STRINGIZE_DETAIL(x)
 
 #define HERE "\n(in file " __FILE__ ":" STRINGIZE(__LINE__) ")"
@@ -535,6 +534,26 @@ inline u64 cntlz64(u64 arg, bool nonzero = false)
 #endif
 }
 
+inline u32 cnttz32(u32 arg, bool nonzero = false)
+{
+#ifdef _MSC_VER
+	ulong res;
+	return _BitScanForward(&res, arg) || nonzero ? res : 32;
+#else
+	return arg || nonzero ? __builtin_ctzll(arg) : 32;
+#endif
+}
+
+inline u64 cnttz64(u64 arg, bool nonzero = false)
+{
+#ifdef _MSC_VER
+	ulong res;
+	return _BitScanForward64(&res, arg) || nonzero ? res : 64;
+#else
+	return arg || nonzero ? __builtin_ctzll(arg) : 64;
+#endif
+}
+
 // Helper function, used by ""_u16, ""_u32, ""_u64
 constexpr u8 to_u8(char c)
 {
@@ -973,9 +992,10 @@ constexpr FORCE_INLINE error_code::not_an_error not_an_error(const T& value)
 }
 
 // Synchronization helper (cache-friendly busy waiting)
-inline void busy_wait(std::size_t count = 100)
+inline void busy_wait(std::size_t cycles = 3000)
 {
-	while (count--) _mm_pause();
+	const u64 s = __rdtsc();
+	do _mm_pause(); while (__rdtsc() - s < cycles);
 }
 
 // Rotate helpers

@@ -57,7 +57,7 @@ void unloadD3D12FunctionPointers()
 
 /**
  * Wait until command queue has completed all task.
- */ 
+ */
 void wait_for_command_queue(ID3D12Device *device, ID3D12CommandQueue *command_queue)
 {
 	ComPtr<ID3D12Fence> fence;
@@ -152,12 +152,12 @@ D3D12GSRender::D3D12GSRender()
 	// Create adapter
 	ComPtr<IDXGIAdapter> adapter;
 	const std::wstring adapter_name = std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>>().from_bytes(g_cfg.video.d3d12.adapter);
-	
+
 	for (UINT id = 0; dxgi_factory->EnumAdapters(id, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; id++)
 	{
 		DXGI_ADAPTER_DESC desc;
 		adapter->GetDesc(&desc);
-		
+
 		// Adapter with specified name
 		if (adapter_name == desc.Description)
 		{
@@ -174,7 +174,7 @@ D3D12GSRender::D3D12GSRender()
 	if (FAILED(wrapD3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_device))))
 	{
 		LOG_ERROR(RSX, "Failed to initialize D3D device on adapter '%s', falling back to first available GPU", g_cfg.video.d3d12.adapter.get());
-		
+
 		//Try to create a device on the first available device
 		if (FAILED(wrapD3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_device))))
 		{
@@ -301,6 +301,17 @@ void D3D12GSRender::on_exit()
 	return GSRender::on_exit();
 }
 
+void D3D12GSRender::do_local_task(rsx::FIFO_state state)
+{
+	if (state != rsx::FIFO_state::lock_wait)
+	{
+		//TODO
+		m_frame->clear_wm_events();
+	}
+
+	rsx::thread::do_local_task(state);
+}
+
 bool D3D12GSRender::do_method(u32 cmd, u32 arg)
 {
 	switch (cmd)
@@ -383,17 +394,17 @@ void D3D12GSRender::end()
 		.Offset((INT)currentDescriptorIndex + vertex_buffer_count, m_descriptor_stride_srv_cbv_uav)
 		);
 
-	if (m_transform_constants_dirty && !g_cfg.video.debug_output)
+	if (!g_cfg.video.debug_output && (m_graphics_state & rsx::pipeline_state::transform_constants_dirty))
 	{
 		m_current_transform_constants_buffer_descriptor_id = (u32)currentDescriptorIndex + 1 + vertex_buffer_count;
 		upload_and_bind_vertex_shader_constants(currentDescriptorIndex + 1 + vertex_buffer_count);
-		m_transform_constants_dirty = false;
 		get_current_resource_storage().command_list->SetGraphicsRootDescriptorTable(VERTEX_CONSTANT_BUFFERS_SLOT,
 			CD3DX12_GPU_DESCRIPTOR_HANDLE(get_current_resource_storage().descriptors_heap->GetGPUDescriptorHandleForHeapStart())
 			.Offset(m_current_transform_constants_buffer_descriptor_id, m_descriptor_stride_srv_cbv_uav)
 			);
 	}
 
+	m_graphics_state &= ~rsx::pipeline_state::memory_barrier_bits;
 
 	std::chrono::time_point<steady_clock> constants_duration_end = steady_clock::now();
 	m_timers.constants_duration += std::chrono::duration_cast<std::chrono::microseconds>(constants_duration_end - constants_duration_start).count();
@@ -461,8 +472,8 @@ void D3D12GSRender::end()
 		0.f,
 		(float)clip_w,
 		(float)clip_h,
-		rsx::method_registers.clip_min(),
-		rsx::method_registers.clip_max(),
+		0.f,
+		1.f,
 	};
 	get_current_resource_storage().command_list->RSSetViewports(1, &viewport);
 
@@ -526,7 +537,7 @@ void D3D12GSRender::flip(int buffer)
 			u32 addr = rsx::get_address(display_buffers[current_display_buffer].offset, CELL_GCM_LOCATION_LOCAL);
 			w = display_buffers[current_display_buffer].width;
 			h = display_buffers[current_display_buffer].height;
-			u8 *src_buffer = vm::ps3::_ptr<u8>(addr);
+			u8 *src_buffer = vm::_ptr<u8>(addr);
 
 			row_pitch = align(w * 4, 256);
 			size_t texture_size = row_pitch * h; // * 4 for mipmap levels

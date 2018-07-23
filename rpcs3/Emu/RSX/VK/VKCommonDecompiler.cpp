@@ -1,71 +1,12 @@
 #include "stdafx.h"
 #include "VKCommonDecompiler.h"
 #include "restore_new.h"
-#include "../../../../Vulkan/glslang/SPIRV/GlslangToSpv.h"
+#include "SPIRV/GlslangToSpv.h"
 #include "define_new_memleakdetect.h"
 
 namespace vk
 {
 	static TBuiltInResource g_default_config;
-
-	std::string getFunctionImpl(FUNCTION f)
-	{
-		switch (f)
-		{
-		default:
-			abort();
-		case FUNCTION::FUNCTION_DP2:
-			return "vec4(dot($0.xy, $1.xy))";
-		case FUNCTION::FUNCTION_DP2A:
-			return "vec4(dot($0.xy, $1.xy) + $2.x)";
-		case FUNCTION::FUNCTION_DP3:
-			return "vec4(dot($0.xyz, $1.xyz))";
-		case FUNCTION::FUNCTION_DP4:
-			return "vec4(dot($0, $1))";
-		case FUNCTION::FUNCTION_DPH:
-			return "vec4(dot(vec4($0.xyz, 1.0), $1))";
-		case FUNCTION::FUNCTION_SFL:
-			return "vec4(0., 0., 0., 0.)";
-		case FUNCTION::FUNCTION_STR:
-			return "vec4(1., 1., 1., 1.)";
-		case FUNCTION::FUNCTION_FRACT:
-			return "fract($0)";
-		case FUNCTION::FUNCTION_REFL:
-			return "vec4($0 - 2.0 * (dot($0, $1)) * $1)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE1D:
-			return "texture($t, $0.x)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE1D_PROJ:
-			return "textureProj($t, $0.x, $1.x)"; // Note: $1.x is bias
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE1D_LOD:
-			return "textureLod($t, $0.x, $1.x)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE1D_GRAD:
-			return "textureGrad($t, $0.x, $1.x, $2.x)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE2D:
-			return "texture($t, $0.xy * texture_parameters[$_i].xy)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE2D_PROJ:
-			return "textureProj($t, $0, $1.x)"; // Note: $1.x is bias
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE2D_LOD:
-			return "textureLod($t, $0.xy * texture_parameters[$_i].xy, $1.x)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE2D_GRAD:
-			return "textureGrad($t, $0.xy * texture_parameters[$_i].xy, $1.xy, $2.xy)"; // Note: $1.x is bias
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLECUBE:
-			return "texture($t, $0.xyz)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLECUBE_PROJ:
-			return "texture($t, ($0.xyz / $0.w))";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLECUBE_LOD:
-			return "textureLod($t, $0.xyz, $1.x)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLECUBE_GRAD:
-			return "textureGrad($t, $0.xyz, $1.xyz, $2.xyz)";
-		case FUNCTION::FUNCTION_DFDX:
-			return "dFdx($0)";
-		case FUNCTION::FUNCTION_DFDY:
-			return "dFdy($0)";
-		case FUNCTION::FUNCTION_VERTEX_TEXTURE_FETCH2D:
-			return "textureLod($t, $0.xy, 0)";
-		case FUNCTION::FUNCTION_TEXTURE_SAMPLE2D_DEPTH_RGBA:
-			return "texture2DReconstruct($t, $0.xy)";
-		}
-	}
 
 	void init_default_resources(TBuiltInResource &rsc)
 	{
@@ -199,10 +140,15 @@ namespace vk
 
 	bool compile_glsl_to_spv(std::string& shader, program_domain domain, std::vector<u32>& spv)
 	{
-		EShLanguage lang = (domain == glsl_fragment_program) ? EShLangFragment : EShLangVertex;
+		EShLanguage lang = (domain == glsl_fragment_program) ? EShLangFragment :
+			(domain == glsl_vertex_program)? EShLangVertex : EShLangCompute;
 
 		glslang::TProgram program;
 		glslang::TShader shader_object(lang);
+
+		shader_object.setEnvInput(glslang::EShSourceGlsl, lang, glslang::EShClientVulkan, 100);
+		shader_object.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetClientVersion::EShTargetVulkan_1_0);
+		shader_object.setEnvTarget(glslang::EshTargetSpv, glslang::EShTargetLanguageVersion::EShTargetSpv_1_0);
 		
 		bool success = false;
 		const char *shader_text = shader.data();
@@ -213,11 +159,13 @@ namespace vk
 		if (shader_object.parse(&g_default_config, 400, EProfile::ECoreProfile, false, true, msg))
 		{
 			program.addShader(&shader_object);
-			success = program.link(EShMsgVulkanRules);
+			success = program.link(msg);
 			if (success)
 			{
-				glslang::TIntermediate* bytes = program.getIntermediate(lang);
-				glslang::GlslangToSpv(*bytes, spv);
+				glslang::SpvOptions options;
+				options.disableOptimizer = false;
+				options.optimizeSize = true;
+				glslang::GlslangToSpv(*program.getIntermediate(lang), spv, &options);
 			}
 		}
 		else

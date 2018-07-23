@@ -37,17 +37,20 @@ auto_pause_settings_dialog::auto_pause_settings_dialog(QWidget *parent) : QDialo
 
 	setMinimumSize(QSize(400, 360));
 	setWindowTitle(tr("Auto Pause Manager"));
+	setObjectName("auto_pause_manager");
 
 	//Events
 	connect(pauseList, &QTableWidget::customContextMenuRequested, this, &auto_pause_settings_dialog::ShowContextMenu);
 	connect(clearButton, &QAbstractButton::clicked, [=](){ m_entries.clear(); UpdateList(); });
 	connect(reloadButton, &QAbstractButton::clicked, [=](){ LoadEntries(); UpdateList(); });
-	connect(saveButton, &QAbstractButton::clicked, [=](){
+	connect(saveButton, &QAbstractButton::clicked, [=]
+	{
 		SaveEntries();
 		LOG_SUCCESS(HLE, "Auto Pause: File pause.bin was updated.");
 	});
 	connect(cancelButton, &QAbstractButton::clicked, this, &QWidget::close);
 
+	Emu.SetForceBoot(true);
 	Emu.Stop();
 
 	LoadEntries();
@@ -177,7 +180,7 @@ void auto_pause_settings_dialog::ShowContextMenu(const QPoint &pos)
 void auto_pause_settings_dialog::OnRemove()
 {
 	QModelIndexList selection = pauseList->selectionModel()->selectedRows();
-	qSort(selection.begin(), selection.end()); // crash on unordered
+	std::sort(selection.begin(), selection.end());
 	for (int i = selection.count() - 1; i >= 0; i--)
 	{
 		m_entries.erase(m_entries.begin() + selection.at(i).row());
@@ -194,7 +197,7 @@ void auto_pause_settings_dialog::keyPressEvent(QKeyEvent *event)
 }
 
 AutoPauseConfigDialog::AutoPauseConfigDialog(QWidget* parent, auto_pause_settings_dialog* apsd, bool newEntry, u32 *entry) 
-	: QDialog(parent), m_presult(entry), b_newEntry(newEntry), apsd_parent(apsd)
+	: QDialog(parent), m_presult(entry), m_newEntry(newEntry), m_apsd(apsd)
 {
 	m_entry = *m_presult;
 	setMinimumSize(QSize(300, -1));
@@ -252,9 +255,9 @@ void AutoPauseConfigDialog::OnOk()
 
 void AutoPauseConfigDialog::OnCancel()
 {
-	if (b_newEntry)
+	if (m_newEntry)
 	{
-		apsd_parent->OnRemove();
+		m_apsd->OnRemove();
 	}
 	close();
 }

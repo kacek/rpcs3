@@ -1,10 +1,10 @@
 #pragma once
 
-namespace vm { using namespace ps3; }
+
 
 static const float CELL_GEM_SPHERE_RADIUS_MM = 22.5f;
 
-// Error Codes
+// Error codes
 enum
 {
 	CELL_GEM_ERROR_RESOURCE_ALLOCATION_FAILED = 0x80121801,
@@ -34,7 +34,7 @@ enum
 	CELL_GEM_NO_EXTERNAL_PORT_DEVICE    = 9,
 };
 
-// General constents
+// General constants
 enum
 {
 	CELL_GEM_CTRL_CIRCLE                                 = 1 << 5,
@@ -59,7 +59,7 @@ enum
 	CELL_GEM_FLAG_CALIBRATION_OCCURRED                   = 1 << 0,
 	CELL_GEM_FLAG_CALIBRATION_SUCCEEDED                  = 1 << 1,
 	CELL_GEM_FLAG_CALIBRATION_WARNING_BRIGHT_LIGHTING    = 1 << 6,
-	ELL_GEM_FLAG_CALIBRATION_WARNING_MOTION_DETECTED     = 1 << 5,
+	CELL_GEM_FLAG_CALIBRATION_WARNING_MOTION_DETECTED    = 1 << 5,
 	CELL_GEM_FLAG_CAMERA_PITCH_ANGLE_CHANGED             = 1 << 9,
 	CELL_GEM_FLAG_CURRENT_HUE_CONFLICTS_WITH_ENVIRONMENT = 1 << 13,
 	CELL_GEM_FLAG_LIGHTING_CHANGED                       = 1 << 7,
@@ -82,6 +82,29 @@ enum
 	CELL_GEM_TRACKING_FLAG_POSITION_TRACKED              = 1 << 0,
 	CELL_GEM_TRACKING_FLAG_VISIBLE                       = 1 << 1,
 	CELL_GEM_VERSION                                     = 2,
+};
+
+// Video conversion flags
+enum
+{
+	CELL_GEM_AUTO_WHITE_BALANCE           = 0x1,
+	CELL_GEM_GAMMA_BOOST                  = 0x2,
+	CELL_GEM_COMBINE_PREVIOUS_INPUT_FRAME = 0x4,
+	CELL_GEM_FILTER_OUTLIER_PIXELS        = 0x8
+};
+
+// Video conversion output formats
+enum
+{
+	CELL_GEM_NO_VIDEO_OUTPUT           = 1,
+	CELL_GEM_RGBA_640x480              = 2,
+	CELL_GEM_YUV_640x480               = 3,
+	CELL_GEM_YUV422_640x480            = 4,
+	CELL_GEM_YUV411_640x480            = 5,
+	CELL_GEM_RGBA_320x240              = 6,
+	CELL_GEM_BAYER_RESTORED            = 7,
+	CELL_GEM_BAYER_RESTORED_RGGB       = 8,
+	CELL_GEM_BAYER_RESTORED_RASTERIZED = 9
 };
 
 struct CellGemAttribute
@@ -118,9 +141,9 @@ struct CellGemImageState
 {
 	be_t<u64> frame_timestamp;
 	be_t<u64> timestamp;
-	be_t<f32> u;
-	be_t<f32> v;
-	be_t<f32> r;
+	be_t<f32> u;         // horizontal screen position in pixels
+	be_t<f32> v;         // vertical screen position in pixels
+	be_t<f32> r;         // size of sphere on screen in pixels
 	be_t<f32> projectionx;
 	be_t<f32> projectiony;
 	be_t<f32> distance;

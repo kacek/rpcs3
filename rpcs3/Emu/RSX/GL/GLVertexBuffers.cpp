@@ -51,9 +51,9 @@ namespace
 		u32 block_sz = vertex_draw_count * type_size;
 
 		gsl::span<gsl::byte> dst{ reinterpret_cast<gsl::byte*>(ptr), ::narrow<u32>(block_sz) };
-		std::tie(min_index, max_index) = write_index_array_data_to_buffer(dst, raw_index_buffer,
+		std::tie(min_index, max_index, vertex_draw_count) = write_index_array_data_to_buffer(dst, raw_index_buffer,
 			type, draw_mode, rsx::method_registers.restart_index_enabled(), rsx::method_registers.restart_index(), first_count_commands,
-			[](auto prim) { return !gl::is_primitive_native(prim); });
+			rsx::method_registers.vertex_data_base_index(), [](auto prim) { return !gl::is_primitive_native(prim); });
 
 		return std::make_tuple(min_index, max_index, vertex_draw_count);
 	}
@@ -134,7 +134,13 @@ namespace
 			    command.raw_index_buffer, ptr, type, rsx::method_registers.current_draw_clause.primitive,
 			    rsx::method_registers.current_draw_clause.first_count_commands, vertex_count);
 
-			//check for vertex arrays with frquency modifiers
+			if (min_index >= max_index)
+			{
+				//empty set, do not draw
+				return{ 0, 0, 0, 0, std::make_tuple(get_index_type(type), offset_in_index_buffer) };
+			}
+
+			//check for vertex arrays with frequency modifiers
 			for (auto &block : m_vertex_layout.interleaved_blocks)
 			{
 				if (block.min_divisor > 1)
@@ -174,7 +180,7 @@ namespace
 	};
 }
 
-std::tuple<u32, u32, u32, std::optional<std::tuple<GLenum, u32>>> GLGSRender::set_vertex_buffer()
+gl::vertex_upload_info GLGSRender::set_vertex_buffer()
 {
 	std::chrono::time_point<steady_clock> then = steady_clock::now();
 
@@ -190,6 +196,7 @@ std::tuple<u32, u32, u32, std::optional<std::tuple<GLenum, u32>>> GLGSRender::se
 	auto required = calculate_memory_requirements(m_vertex_layout, vertex_count);
 
 	std::pair<void*, u32> persistent_mapping = {}, volatile_mapping = {};
+	gl::vertex_upload_info upload_info = { result.vertex_draw_count, result.allocated_vertex_count, result.vertex_index_base, 0u, 0u, result.index_info };
 
 	if (required.first > 0)
 	{
@@ -207,7 +214,7 @@ std::tuple<u32, u32, u32, std::optional<std::tuple<GLenum, u32>>> GLGSRender::se
 			if (auto cached = m_vertex_cache->find_vertex_range(storage_address, GL_R8UI, required.first))
 			{
 				in_cache = true;
-				m_gl_persistent_stream_buffer.copy_from(*m_attrib_ring_buffer, GL_R8UI, cached->offset_in_heap, required.first);
+				upload_info.persistent_mapping_offset = cached->offset_in_heap;
 			}
 			else
 			{
@@ -218,7 +225,7 @@ std::tuple<u32, u32, u32, std::optional<std::tuple<GLenum, u32>>> GLGSRender::se
 		if (!in_cache)
 		{
 			persistent_mapping = m_attrib_ring_buffer->alloc_from_heap(required.first, m_min_texbuffer_alignment);
-			m_gl_persistent_stream_buffer.copy_from(*m_attrib_ring_buffer, GL_R8UI, persistent_mapping.second, required.first);
+			upload_info.persistent_mapping_offset = persistent_mapping.second;
 
 			if (to_store)
 			{
@@ -226,12 +233,34 @@ std::tuple<u32, u32, u32, std::optional<std::tuple<GLenum, u32>>> GLGSRender::se
 				m_vertex_cache->store_range(storage_address, GL_R8UI, required.first, persistent_mapping.second);
 			}
 		}
+
+		if (!m_persistent_stream_view.in_range(upload_info.persistent_mapping_offset, required.first, upload_info.persistent_mapping_offset))
+		{
+			verify(HERE), m_max_texbuffer_size < m_attrib_ring_buffer->size();
+			const size_t view_size = ((upload_info.persistent_mapping_offset + m_max_texbuffer_size) > m_attrib_ring_buffer->size()) ?
+				(m_attrib_ring_buffer->size() - upload_info.persistent_mapping_offset) : m_max_texbuffer_size;
+
+			m_persistent_stream_view.update(m_attrib_ring_buffer.get(), upload_info.persistent_mapping_offset, (u32)view_size);
+			m_gl_persistent_stream_buffer->copy_from(m_persistent_stream_view);
+			upload_info.persistent_mapping_offset = 0;
+		}
 	}
 
 	if (required.second > 0)
 	{
 		volatile_mapping = m_attrib_ring_buffer->alloc_from_heap(required.second, m_min_texbuffer_alignment);
-		m_gl_volatile_stream_buffer.copy_from(*m_attrib_ring_buffer, GL_R8UI, volatile_mapping.second, required.second);
+		upload_info.volatile_mapping_offset = volatile_mapping.second;
+
+		if (!m_volatile_stream_view.in_range(upload_info.volatile_mapping_offset, required.second, upload_info.volatile_mapping_offset))
+		{
+			verify(HERE), m_max_texbuffer_size < m_attrib_ring_buffer->size();
+			const size_t view_size = ((upload_info.volatile_mapping_offset + m_max_texbuffer_size) > m_attrib_ring_buffer->size()) ?
+				(m_attrib_ring_buffer->size() - upload_info.volatile_mapping_offset) : m_max_texbuffer_size;
+
+			m_volatile_stream_view.update(m_attrib_ring_buffer.get(), upload_info.volatile_mapping_offset, (u32)view_size);
+			m_gl_volatile_stream_buffer->copy_from(m_volatile_stream_view);
+			upload_info.volatile_mapping_offset = 0;
+		}
 	}
 
 	//Write all the data
@@ -239,7 +268,7 @@ std::tuple<u32, u32, u32, std::optional<std::tuple<GLenum, u32>>> GLGSRender::se
 
 	std::chrono::time_point<steady_clock> now = steady_clock::now();
 	m_vertex_upload_time += std::chrono::duration_cast<std::chrono::microseconds>(now - then).count();
-	return std::make_tuple(result.vertex_draw_count, result.allocated_vertex_count, result.vertex_index_base, result.index_info);
+	return upload_info;
 }
 
 namespace
